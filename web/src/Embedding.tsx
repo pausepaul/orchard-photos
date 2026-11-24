@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
-import { Maximize, Minus, Plus } from 'lucide-react';
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Maximize, Minus, Plus, X } from 'lucide-react';
 import { MapEngine, PER_SHEET } from './mapEngine';
 import type { MapCallbacks, MapCamera, MapPoint } from './mapEngine';
-import { APP_NAME, SET_UP, filterParams, megabytes, plural, preparing, request, storageKey } from './types';
+import { APP_NAME, SET_UP, fileName, filterParams, imageUrl, megabytes, plural, preparing, request, storageKey } from './types';
 import { type Estimate, Progress } from './Progress';
 import { estimated, searchWork } from './Activity';
 import type { Filters, Model, SearchCondition, SearchStatus } from './types';
@@ -44,6 +44,44 @@ interface Props {
   ref?: React.Ref<MapHandle>;
 }
 
+const NEARBY_PAGE_SIZE = 32;
+
+function NearbyImages({ points, onOpen, onClose }: {
+  points: MapPoint[];
+  onOpen: (id: string) => void;
+  onClose: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [limit, setLimit] = useState(NEARBY_PAGE_SIZE);
+  useLayoutEffect(() => {
+    const node = dialog.current!;
+    node.showModal();
+    node.focus();
+    return () => node.close();
+  }, []);
+
+  return <dialog ref={dialog} tabIndex={-1} className="panel map-nearby" aria-label="Images at this point"
+    onCancel={e => { e.preventDefault(); e.stopPropagation(); onClose(); }}
+    onClick={e => {
+      if (e.target !== e.currentTarget) return;
+      const bounds = e.currentTarget.getBoundingClientRect();
+      if (e.clientX < bounds.left || e.clientX > bounds.right || e.clientY < bounds.top || e.clientY > bounds.bottom) onClose();
+    }}>
+    <header><h2>{points.length.toLocaleString()} images at this point</h2><button className="icon-button" aria-label="Close nearby images" onClick={onClose}><X /></button></header>
+    <div className="panel-body">
+      <ul className="map-nearby-list">
+        {points.slice(0, limit).map(point => <li key={point.id}>
+          <button type="button" className="text-button map-nearby-image" title={point.path} onClick={() => onOpen(point.id)}>
+            <img src={imageUrl(point.id)} alt="" loading="lazy" decoding="async" />
+            <span>{fileName(point.path)}</span>
+          </button>
+        </li>)}
+      </ul>
+      {limit < points.length && <button className="text-button secondary" onClick={() => setLimit(n => n + NEARBY_PAGE_SIZE)}>Show more images</button>}
+    </div>
+  </dialog>;
+}
+
 export default function Embedding({ noun, root, filters, highlight, search, condition, model, revision, filtered, searching, onOpen, onSimilar, onCarry, progress, onSetUp, onReset, onWaiting, ref }: Props) {
   const stage = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -52,8 +90,10 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
   const [error, setError] = useState('');
   const [data, setData] = useState<MapData | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [nearby, setNearby] = useState<string[]>([]);
   const [retry, setRetry] = useState(0);
   const [working, setWorking] = useState<Working | null>(null);
+  const [waitingKey, setWaitingKey] = useState<string | null>(null);
   const [slow, setSlow] = useState(false);
   const [sheetsLoaded, setSheetsLoaded] = useState<number | null>(null);
   const shown = useRef({ key: '', sheets: '' });
@@ -62,8 +102,9 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
   const unprepared = condition !== 'on';
   const filling = preparing(search);
   const work = estimated(searchWork(search), progress);
-  // A folder's first map waits for all of its images, so its first layout is the real one.
-  const holding = filling && !data;
+  // Reuse already placed images during indexing. The first fit waits for the full index.
+  const holding = filling && (search.indexed === 0 || waitingKey === key);
+  const mapRevision = filling ? 0 : revision;
   useEffect(() => { onWaiting(holding); return () => onWaiting(false); }, [holding, onWaiting]);
   const byId = useMemo(() => new Map((data?.points ?? []).map(p => [p.id, p])), [data]);
   const callbacks = useRef({ open: (id: string) => { const point = byId.get(id); if (point) onOpen(point); }, carry: onCarry });
@@ -74,6 +115,7 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
     const map = new MapEngine(canvas.current!, stage.current!, {
       onSelect: setSelectedId,
       onOpen: id => callbacks.current.open(id),
+      onNearby: setNearby,
       onCarry: (id, x, y, dropped) => callbacks.current.carry(id, x, y, dropped),
       onSettle: camera => { try { localStorage.setItem(STORAGE, JSON.stringify({ key: keyRef.current, ...camera })); } catch { /* Position is a convenience. */ } },
     });
@@ -101,19 +143,15 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
     if (unprepared || holding) return;
     const controller = new AbortController();
     setPhase(old => old === 'ready' ? old : 'loading'); setError('');
-    const params = new URLSearchParams(filterParams(filters));
-    (async () => {
-      const result = await request<MapData>(`/api/map?${params}`, { signal: controller.signal });
-      if (result.layout.state !== 'ready') {
-        // The first UMAP fit runs on the server; follow it, then load the map.
-        setWorking(result.layout);
-        await follow(controller.signal);
-        setWorking(null); setRetry(r => r + 1);
-        return;
-      }
+    const load = (cached: boolean) => {
+      const params = new URLSearchParams(filterParams(filters));
+      if (cached) params.set('cached', '1');
+      return request<MapData>(`/api/map?${params}`, { signal: controller.signal });
+    };
+    const show = async (result: MapData) => {
       setWorking(null);
       // Only the sheets holding the shown images are decoded, and a filter that needs the same ones keeps them.
-      const needed = [...new Set(result.points.map(p => Math.floor(p.slot / PER_SHEET)))].sort((a, b) => a - b);
+      const needed = [...new Set(result.points.filter(p => p.slot >= 0).map(p => Math.floor(p.slot / PER_SHEET)))].sort((a, b) => a - b);
       const versions = needed.map(n => `${n}:${result.sheets[n]}`).join();
       let sheets: ImageBitmap[] | null = null;
       if (versions !== shown.current.sheets) {
@@ -137,10 +175,36 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
       else map.setPoints(result.points, readCamera(key));
       shown.current = { key, sheets: versions };
       setData(result); setPhase('ready'); setSheetsLoaded(null);
+    };
+    (async () => {
+      // Keep the saved map usable while the server places newly indexed images.
+      if (filling || search.total > 4096) {
+        const cached = await load(true);
+        if (controller.signal.aborted) return;
+        if (cached.layout.state === 'ready') {
+          setWaitingKey(null);
+          await show(cached);
+          if (filling || (!cached.pending && cached.points.length > 4096)) return;
+        } else if (filling) {
+          setWorking(null); setWaitingKey(key);
+          return;
+        }
+      }
+      if (controller.signal.aborted) return;
+      const result = await load(false);
+      if (result.layout.state !== 'ready') {
+        // The first UMAP fit runs on the server; follow it, then load the map.
+        setWorking(result.layout);
+        await follow(controller.signal);
+        setWorking(null); setRetry(r => r + 1);
+        return;
+      }
+      setWaitingKey(null);
+      await show(result);
     })().catch(e => { if (e.name !== 'AbortError') { setError(e instanceof TypeError ? `${APP_NAME} could not be reached. Check that it is running, then retry.` : e.message); setPhase('error'); } });
     return () => controller.abort();
     // The map reloads when the folder or filters change, a scan lands, or the user retries; search only lights points up.
-  }, [key, revision, retry, unprepared, filling]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [key, mapRevision, retry, unprepared, filling, holding]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const lit = highlight;
   useEffect(() => { if (phase === 'ready') engine.current?.setHighlight(lit); }, [lit, phase, data]);
@@ -154,14 +218,16 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
     place: id => engine.current?.place(id) ?? null,
   }), []);
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && selectedId) { e.preventDefault(); callbacks.current.open(selectedId); return; }
+    if (e.key === 'Enter' && selectedId) { e.preventDefault(); engine.current?.openSelected(); return; }
     if ((e.key === 's' || e.key === 'S') && selectedId && !e.metaKey && !e.ctrlKey) { e.preventDefault(); onSimilar(selectedId); return; }
     if (engine.current?.key(e.nativeEvent)) e.preventDefault();
   };
 
   const empty = phase === 'ready' && data && data.points.length === 0;
+  const nearbyPoints = nearby.map(id => byId.get(id)).filter((point): point is MapPoint => point !== undefined);
+  const closeNearby = () => { setNearby([]); canvas.current?.focus(); };
   return <div className="map-stage" ref={stage} aria-busy={phase === 'loading'}>
-    <canvas ref={canvas} className="map-canvas" tabIndex={0} role="application" aria-label="Image map. Similar images sit close together. Arrow keys move, plus and minus zoom, zero shows everything, Enter selects the image nearest the middle. Press and hold an image, then drag it to the search bar to find similar images." onKeyDown={onKeyDown} />
+    <canvas ref={canvas} className="map-canvas" tabIndex={0} role="application" aria-label="Image map. Similar images sit close together. Arrow keys move, plus and minus zoom, zero shows everything, Enter selects or opens an image. Choose from a list when several images share a point. Press and hold an image, then drag it to the search bar to find similar images." onKeyDown={onKeyDown} />
     {phase === 'loading' && !unprepared && !holding && <div className="map-placeholder" role="status" aria-label="Placing images">{placeholder.map((p, i) => <span key={i} style={{ left: `${p.x}%`, top: `${p.y}%`, animationDelay: `${p.delay}s` }} />)}</div>}
     {slow && busy && <div className="map-progress"><Progress value={working ? null : sheetsLoaded} label={working?.stage || 'Loading the map'} /></div>}
     {slow && working && <p className="map-note" role="status">{working.stage}…</p>}
@@ -175,6 +241,7 @@ export default function Embedding({ noun, root, filters, highlight, search, cond
     {/* While images are being prepared, the status line counts them. */}
     {phase === 'ready' && !working && !!data?.pending && search.state !== 'indexing' && <p className="map-note" aria-live="polite">{plural(data.pending, noun)} {data.pending === 1 ? 'isn’t' : 'aren’t'} on the map yet</p>}
     {phase === 'ready' && !working && !data?.pending && !!data?.omitted && <p className="map-note">The map shows the newest {data.points.length.toLocaleString()} images. Filter by date or folder to see the other {data.omitted.toLocaleString()}.</p>}
+    {nearbyPoints.length > 1 && <NearbyImages points={nearbyPoints} onClose={closeNearby} onOpen={id => { setNearby([]); callbacks.current.open(id); }} />}
     {phase === 'ready' && !empty && <div className="map-controls" role="group" aria-label="Map view">
       <button className="icon-button" aria-label="Zoom in" title="Zoom in" onClick={() => engine.current?.zoomBy(1.7)}><Plus /></button>
       <button className="icon-button" aria-label="Zoom out" title="Zoom out" onClick={() => engine.current?.zoomBy(1 / 1.7)}><Minus /></button>

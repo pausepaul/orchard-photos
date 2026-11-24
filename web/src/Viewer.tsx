@@ -201,7 +201,7 @@ export default function Viewer({ items, index, total, hasMore, loadingMore, page
         <p className={error || pageError ? 'detail-status error-copy' : 'detail-status'} role="status">{error || pageError || (copied?.id === item.id ? copied.note : '')}</p>
         {members.length > 1 && <section className="near-duplicates" aria-labelledby={stackHeading}>
           <h2 id={stackHeading}>{plural(members.length, 'near-duplicate')}</h2>
-          <ul>{members.map((member, place) => <li key={member.id}><button aria-pressed={place === shown} aria-label={`Show ${fileName(member.path)}`} onClick={() => showMember(place)}><img src={imageUrl(member.id)} alt="" decoding="async" onDragStart={dragImage(member.id)} /></button></li>)}</ul>
+          <ul>{members.map((member, place) => <li key={member.id}><button aria-pressed={place === shown} aria-label={`Show ${fileName(member.path)}`} onClick={() => showMember(place)}><img src={imageUrl(member.id)} alt="" loading="lazy" decoding="async" onDragStart={dragImage(member.id)} /></button></li>)}</ul>
         </section>}
       </aside>
     </div>

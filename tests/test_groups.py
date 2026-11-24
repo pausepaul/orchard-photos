@@ -1,10 +1,12 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image, ImageFilter
 
+from server import groups
 from server.cache import connect, thumbnail_path
 from server.groups import THRESHOLD, Groups, gather, sharpness, stem
 from server.scanner import Scanner
@@ -36,6 +38,25 @@ class GatherTests(unittest.TestCase):
         for index, centre in enumerate(centres):
             self.assertGreaterEqual(float(matrix[index] @ matrix[centre]), THRESHOLD)
         self.assertGreater(len(set(centres)), 1)
+
+    def test_clustered_grouping_matches_exact_grouping(self):
+        rng = np.random.default_rng(7)
+        centres = np.linalg.qr(rng.normal(size=(16, 16)))[0][:10]
+        vectors = []
+        for cluster in range(10):
+            base = centres[cluster]
+            # Add a burst of near-duplicates and several distinct vectors around each cluster centre.
+            for noise in (0.0, 0.02, 0.03):
+                v = base + rng.normal(scale=noise, size=16)
+                vectors.append(v / np.linalg.norm(v))
+            for _ in range(9):
+                v = base + rng.normal(scale=0.25, size=16)
+                vectors.append(v / np.linalg.norm(v))
+        matrix = np.stack(vectors).astype('<f4')
+        exact = gather(matrix)
+        with patch.object(groups, 'EXACT_LIMIT', 0):
+            clustered = gather(matrix)
+        np.testing.assert_array_equal(clustered, exact)
 
 
 class FamilyTests(unittest.TestCase):
@@ -99,6 +120,27 @@ class GroupsTests(unittest.TestCase):
         self.assertGreater(stored[crisp][1], stored[blurry][1])
         self.assertNotIn(alone, stored)
 
+    def test_equivalent_rows_keep_all_images_and_do_not_hide_different_pixels(self):
+        photo = checkerboard()
+        small = self.add(1, turned(0), photo, width=640, camera=None)
+        large = self.add(2, turned(0), photo, width=1280, camera=None)
+        distinct = self.add(3, turned(0), Image.new('RGB', photo.size, 'white'), width=640, camera=None)
+        with patch.object(groups, 'EXACT_LIMIT', 2), patch.object(groups, 'sharpness', wraps=sharpness) as measure:
+            self.assertTrue(self.groups.update())
+        measure.assert_called_once()
+        stored = self.stored()
+        self.assertEqual(set(stored), {small, large})
+        self.assertEqual(stored[small][0], stored[large][0])
+        self.assertGreater(stored[large][1], stored[small][1])
+        self.assertNotIn(distinct, stored)
+
+    def test_weighted_centres_keep_the_order_of_expanded_neighbour_counts(self):
+        matrix = np.stack([turned(0), turned(10), turned(20), turned(30)])
+        weights = np.array([4, 1, 1, 3])
+        expanded = np.repeat(matrix, weights, axis=0)
+        starts = np.cumsum(weights) - weights
+        np.testing.assert_array_equal(starts[gather(matrix, weights=weights)], gather(expanded)[starts])
+
     def test_regrouping_only_when_embeddings_change(self):
         self.add(1, turned(0), checkerboard())
         self.add(2, turned(3), checkerboard())
@@ -109,6 +151,64 @@ class GroupsTests(unittest.TestCase):
         self.add(4, turned(1), checkerboard())
         self.assertTrue(self.groups.update())
         self.assertEqual(len(self.stored()), 3)
+
+    def test_completed_groups_are_reused_on_reopen(self):
+        self.add(1, turned(0), checkerboard())
+        self.add(2, turned(3), checkerboard())
+        self.assertTrue(self.groups.update())
+        expected = self.stored()
+        reopened = Groups(self.directory, self.semantic)
+        with patch.object(self.semantic, 'embeddings', side_effect=AssertionError('read embeddings')):
+            self.assertFalse(reopened.update())
+        self.assertEqual(self.stored(), expected)
+
+    def test_existing_groups_without_a_completion_marker_are_checked(self):
+        image_id = self.add(1, turned(0), checkerboard())
+        with connect(self.directory) as db:
+            db.execute('INSERT INTO image_groups VALUES (?,?,?)', (image_id, image_id, 1))
+        self.assertTrue(self.groups.update())
+        self.assertFalse(self.stored())
+
+    def test_renaming_a_file_can_change_groups_without_new_embeddings(self):
+        original = self.add(1, turned(0), checkerboard())
+        crop = self.add(2, turned(40), checkerboard())
+        with connect(self.directory) as db:
+            for name, image_id in [('photo.jpg', original), ('other.jpg', crop)]:
+                db.execute("INSERT INTO files VALUES (?, '', ?, 100, 0, '', NULL)", (name, image_id))
+        self.assertFalse(self.groups.update())
+        with connect(self.directory) as db:
+            db.execute("UPDATE files SET path = 'photo copy.jpg' WHERE image_id = ?", (crop,))
+        self.assertTrue(self.groups.update())
+        self.assertEqual(self.stored()[original][0], self.stored()[crop][0])
+
+    def test_updating_a_vector_in_place_invalidates_the_cached_matrix(self):
+        self.add(1, turned(0), checkerboard())
+        changed = self.add(2, turned(3), checkerboard())
+        self.assertTrue(self.groups.update())
+        with connect(self.directory) as db:
+            db.execute("UPDATE semantic_embeddings SET vector = ? WHERE image_id = ?",
+                       (turned(90).tobytes(), changed))
+        self.assertTrue(self.groups.update())
+        self.assertFalse(self.stored())
+
+    def test_input_change_during_grouping_invalidates_the_result(self):
+        self.add(1, turned(0), checkerboard())
+        newer = self.add(2, turned(3), checkerboard())
+
+        def gather_and_change(*args):
+            centres = gather(*args)
+            with connect(self.directory) as db:
+                db.execute("INSERT OR REPLACE INTO semantic_embeddings VALUES (?,?,?)",
+                           (newer, MODEL, turned(90).tobytes()))
+            return centres
+
+        with patch.object(groups, 'gather', side_effect=gather_and_change):
+            self.assertFalse(self.groups.update())
+        self.assertFalse(self.stored())
+        with patch.object(groups, 'gather', wraps=gather) as gather_again:
+            self.assertFalse(self.groups.update())
+            gather_again.assert_called_once()
+        self.assertFalse(self.stored())
 
     def test_the_larger_of_two_equally_sharp_copies_scores_higher(self):
         small = self.add(1, turned(0), checkerboard(), width=600)

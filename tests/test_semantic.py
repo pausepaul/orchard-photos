@@ -1,3 +1,4 @@
+import hashlib
 from io import BytesIO
 from pathlib import Path
 import tempfile
@@ -51,7 +52,8 @@ class SemanticTests(unittest.TestCase):
         with connect(self.search.directory) as connection:
             for image_id in ids:
                 if readable:
-                    Image.new("RGB", (8, 8), (len(image_id), 0, 0)).save(thumbnail_path(self.directory, image_id), "WEBP")
+                    color = tuple(hashlib.sha256(image_id.encode()).digest()[:3])
+                    Image.new("RGB", (8, 8), color).save(thumbnail_path(self.directory, image_id), "WEBP", lossless=True)
                 connection.execute("INSERT INTO images VALUES (?, ?)", (image_id, taken))
                 connection.execute("INSERT INTO files VALUES (?, ?, ?)", (f"{image_id}.png", image_id, modified))
 
@@ -360,23 +362,27 @@ class SemanticTests(unittest.TestCase):
         # A copy of "old" written recently makes it recent.
         with connect(self.search.directory) as connection:
             connection.execute("INSERT INTO files VALUES ('copy.png', 'old', '2025-01-01T00:00:00Z')")
-        order = []
         with patch.object(self.encoder, "load"), patch.object(self.encoder, "features", return_value=np.eye(4, dtype=np.float32)), \
-                patch.object(self.search, "_open_images", side_effect=lambda image_id: order.append(image_id) or [Image.new("RGB", (8, 8))]):
+                patch.object(self.search, "_read_inputs", wraps=self.search._read_inputs) as read:
             self.search.index()
         # The photo's capture date counts, not when its file was written.
-        self.assertEqual(order, ["new", "old", "photo", "middle"])
+        self.assertEqual([call.args[0] for call in read.call_args_list], ["new", "old", "photo", "middle"])
 
     def test_a_video_is_searched_as_the_average_of_its_frames(self):
         self.add("photo", "video")
         frame_path(self.directory, "video", 0).parent.mkdir(exist_ok=True)
-        for place in range(3):
-            Image.new("RGB", (8, 8)).save(frame_path(self.directory, "video", place), "WEBP")
+        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        for place, color in enumerate(colors):
+            Image.new("RGB", (8, 8), color).save(frame_path(self.directory, "video", place), "WEBP", lossless=True)
         features = np.array([[1, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
-        with patch.object(self.encoder, "load"), patch.object(self.encoder, "features", return_value=features) as encode:
+
+        def encode(images):
+            self.assertEqual(len(images), 4)
+            self.assertEqual([image.getpixel((0, 0)) for image in images[1:]], colors)
+            return features
+
+        with patch.object(self.encoder, "load"), patch.object(self.encoder, "features", side_effect=encode):
             self.search.index()
-        # The photo's thumbnail, then the video's three frames, in one batch.
-        self.assertEqual(len(encode.call_args.kwargs["images"]), 4)
         ids, matrix = self.search.embeddings()
         vectors = dict(zip(ids, matrix))
         np.testing.assert_allclose(vectors["photo"], [1, 0, 0])
@@ -469,6 +475,28 @@ class SemanticTests(unittest.TestCase):
         self.assertEqual(encode.call_count, 2)
         status = self.search.status()
         self.assertEqual((status["state"], status["indexed"], status["total"]), ("ready", 3, 3))
+
+    def test_identical_inputs_share_inference_but_every_image_gets_its_own_vector(self):
+        for day, image_id in enumerate("fdcbae", 1):
+            self.add(image_id, modified=f"2026-01-{day:02d}T00:00:00Z")
+        shared = thumbnail_path(self.directory, "a").read_bytes()
+        for image_id in ("b", "d"):
+            thumbnail_path(self.directory, image_id).write_bytes(shared)
+        for image_id in ("e", "f"):
+            thumbnail_path(self.directory, image_id).write_bytes(b"Invalid WebP")
+        features = [np.array([[1, 0]], dtype=np.float32), np.array([[0, 1]], dtype=np.float32)]
+        with patch("server.semantic.BATCH_SIZE", 2), patch.object(self.encoder, "load"), \
+                patch.object(self.encoder, "features", side_effect=features) as encode, \
+                self.assertLogs("server.semantic", level="WARNING"):
+            self.search.index()
+        self.assertEqual([len(call.kwargs["images"]) for call in encode.call_args_list], [1, 1])
+        ids, matrix = self.search.embeddings()
+        vectors = dict(zip(ids, matrix))
+        self.assertEqual(set(vectors), {"a", "b", "c", "d"})
+        for image_id in ("a", "b", "d"):
+            np.testing.assert_array_equal(vectors[image_id], [1, 0])
+        np.testing.assert_array_equal(vectors["c"], [0, 1])
+        self.assertIn("2 files could not be read", self.search.status()["error"])
 
     def test_unreadable_image_is_reported_without_discarding_good_images(self):
         self.add("1")

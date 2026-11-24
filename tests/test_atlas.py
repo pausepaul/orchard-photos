@@ -44,6 +44,15 @@ class AtlasTests(unittest.TestCase):
         self.assertGreater(blue[2], 200)
         self.assertEqual(corner[3], 0)
 
+    def test_only_requested_icons_take_slots(self):
+        for name in 'abc':
+            self.add(name, (0, 0, 0))
+        self.assertEqual(self.atlas.ensure(iter(['c', 'a', 'c'])), {'c': 0, 'a': 1})
+        self.assertEqual(self.atlas.ensure([]), {})
+        with connect(self.data) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM atlas_slots").fetchone()[0], 2)
+        self.assertEqual(self.atlas.ensure(['b', 'c']), {'b': 2, 'c': 0})
+
     def test_an_unreadable_image_still_gets_a_placeholder_slot(self):
         self.add("a", (1, 2, 3))
         thumbnail_path(self.data, "a").write_bytes(b"not an image")

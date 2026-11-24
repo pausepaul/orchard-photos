@@ -8,7 +8,7 @@ interface Work { key: string; label: string; detail: string; value: number | nul
 
 function scanWork(scan: Scan): Work | null {
   if (scan.state !== 'scanning' || !scan.changed) return null;
-  return { key: 'scan', label: 'Reading images', detail: `${(scan.done ?? 0).toLocaleString()} of ${scan.changed.toLocaleString()}`, value: (scan.done ?? 0) / scan.changed };
+  return { key: 'scan', label: 'Reading new or changed images', detail: `${(scan.done ?? 0).toLocaleString()} of ${scan.changed.toLocaleString()}`, value: (scan.done ?? 0) / scan.changed };
 }
 
 /** Visual search's work, named the same in the status line, the search options and the map. */
@@ -20,7 +20,7 @@ export function searchWork(search: SearchStatus): Work | null {
   return null;
 }
 
-/** A job and how far it has got, as one phrase: "Reading images: 1,200 of 7,872". */
+/** A job and how far it has got, as one phrase: "Reading new or changed images: 1,200 of 7,872". */
 export const workLabel = (work: Work) => work.detail ? `${work.label}: ${work.detail}` : work.label;
 
 /** Why visual search can't answer yet, for where it is chosen. How far along it is stays in the status line. */

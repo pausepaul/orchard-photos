@@ -40,7 +40,7 @@ export interface Model { present: boolean; size: number }
 /** What setting up visual search is called, the same wherever it is offered. */
 export const SET_UP = 'Set up visual search';
 /** `photos` is the path that opens the Photos library, on a Mac that can read it. */
-export interface Status { app: string; version: string; platform: string; picker: boolean; model: Model; folder: Folder | null; library: LibraryStatus | null; recent: RecentFolder[]; photos: string | null }
+export interface Status { app: string; version: string; platform: string; picker: boolean; model: Model; folder: Folder | null; library: LibraryStatus | null; recent: RecentFolder[]; photos: string | null; watch?: boolean }
 /** The opt-in check for a newer release, and the release it found, if any. */
 export interface Updates { enabled: boolean; update: { version: string; url: string } | null }
 /** The folder, as the path '', its subfolders and its file types, each with how many tiles the grid shows for it. */

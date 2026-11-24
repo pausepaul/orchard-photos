@@ -10,6 +10,8 @@ export interface MapCallbacks {
   onSelect: (id: string | null) => void;
   /** An image was clicked or tapped. */
   onOpen: (id: string) => void;
+  /** More than one image shares a small area of the map; let the viewer choose which one to open. */
+  onNearby: (ids: string[]) => void;
   /** A lifted image is being carried, at a viewport position, or was just let go (`dropped`), or the carry was
    *  cancelled (`id` null). Returns whether the position is a drop target. */
   onCarry: (id: string | null, x: number, y: number, dropped: boolean) => boolean;
@@ -20,7 +22,6 @@ export interface MapCallbacks {
 const CELL = 64, INSET = 2, INNER = CELL - 2 * INSET, COLUMNS = 32;
 export const PER_SHEET = COLUMNS * COLUMNS;
 const CORNER = 7 / INNER;
-const DIMMED = 0.22;
 // The play mark on a video is a disc a quarter of the icon wide, kept off icons too small for it to read.
 const MARK = 0.26;
 const MARK_MIN = 18;
@@ -28,17 +29,21 @@ const MARK_MIN = 18;
 const HOLD = 250;
 // Pointer travel that turns a press into a pan.
 const SLOP = 5;
-const RECEDED = 0.5;
 const SHARP_AT = 72;
-const MAX_ZOOM = 120;
+// At seven decimal places, the smallest change in position can separate two previews by 100 CSS px.
+const MAX_WORLD_SCALE = 1_000_000_000;
 const MIN_ZOOM = 0.4;
-const MAX_ICON = 220;
 const MAX_LOADS = 8;
 const MAX_THUMBS = 480;
-// How far past each edge of the view the zoomed-out layer reaches, so a pan rarely has to redraw it.
-const LAYER_MARGIN = 256;
+const DOT_CELL = 3;
+const PREVIEW_ZOOM = 4;
+const MAX_PREVIEWS = 64;
+const MAX_ICON = 88;
+const PREVIEW_GAP = 6;
+const POINT_RADIUS = 7;
 
 interface Camera { x: number; y: number; k: number }
+interface Preview { point: number; size: number; focused: boolean }
 // A sharp thumbnail, decoded at `resolution` pixels square or its own size if smaller.
 interface Thumb { bitmap: ImageBitmap | null; resolution: number; loading: boolean; shown: number; used: number }
 
@@ -63,14 +68,15 @@ export class MapEngine {
   private hovered = -1; private selected = -1;
   private members: Set<number> | null = null;
   private lift = new Map<number, number>();
-  private dim = 0; private intro = 1;
-  private morphing = 1; private morphFrom = new Float32Array(0); private morphTo = new Float32Array(0);
+  private highlightedIds: string[] | null = null;
+  private morphing = 1; private morphFrom = new Float64Array(0); private morphTo = new Float64Array(0);
   private sx = new Float32Array(0); private sy = new Float32Array(0);
   private order: number[] = [];
+  private hasAtlas = false;
+  private previews: Preview[] = [];
+  private dots: { context: CanvasRenderingContext2D; pixels: ImageData } | null = null;
+  private thumbRequests = new AbortController();
   private thumbs = new Map<string, Thumb>();
-  // The zoomed-out icons drawn once, and a count that changes whenever what they show does.
-  private layer: { canvas: HTMLCanvasElement; key: string; x: number; y: number } | null = null;
-  private scene = 0;
   private loading = 0;
   private frame = 0; private last = 0; private clock = 0;
   private settle = 0;
@@ -104,8 +110,9 @@ export class MapEngine {
     s.removeEventListener('pointercancel', this.cancel);
     s.removeEventListener('pointerleave', this.leave);
     s.removeEventListener('dblclick', this.double);
+    this.thumbRequests.abort();
     this.thumbs.forEach(thumb => thumb.bitmap?.close()); this.thumbs.clear(); this.sheets.forEach(sheet => sheet.close()); this.sheets = [];
-    if (this.layer) { this.layer.canvas.width = 0; this.layer = null; }
+    this.dots = null;
   }
 
   // ---- Data ------------------------------------------------------------------------------------
@@ -118,49 +125,54 @@ export class MapEngine {
     if (first && this.points.length) this.fit(false);
     else if (this.points.length) {
       // Keep the same framing when the window changes shape.
-      this.fitK = this.frameOf(this.points.map((_, i) => i)).k;
+      this.fitK = this.frameOf().k;
       const ratio = this.fitK / before;
-      this.cam.k *= ratio; this.goal.k *= ratio;
+      this.cam.k = this.clampScale(this.cam.k * ratio); this.goal.k = this.clampScale(this.goal.k * ratio);
       if (this.anchor) this.anchor = null;
     }
     this.invalidate();
   }
 
   /** Icon sheets by number. Sheets no point uses can be missing. */
-  setSheets(sheets: ImageBitmap[]) { this.sheets.forEach(sheet => sheet.close()); this.sheets = sheets; this.scene++; this.invalidate(); }
+  setSheets(sheets: ImageBitmap[]) { this.sheets.forEach(sheet => sheet.close()); this.sheets = sheets; this.invalidate(); }
 
   setPoints(points: MapPoint[], restore?: MapCamera) {
     const selected = this.selected >= 0 ? this.points[this.selected]?.id : null;
-    this.points = points; this.morphing = 1; this.scene++;
-    this.index = new Map(points.map((p, i) => [p.id, i]));
+    this.points = points; this.morphing = 1;
+    this.hasAtlas = points.some(point => point.slot >= 0);
+    this.previews = [];
+    this.index.clear();
+    points.forEach((p, i) => this.index.set(p.id, i));
     this.sx = new Float32Array(points.length); this.sy = new Float32Array(points.length);
-    this.hovered = -1; this.lift.clear(); this.members = null; this.dim = 0;
+    this.hovered = -1; this.lift.clear(); this.members = null;
     this.selected = selected ? this.index.get(selected) ?? -1 : -1;
     if (this.selected < 0 && selected) this.calls.onSelect(null);
     this.measure();
     if (this.w) {
-      this.fitK = this.frameOf(this.points.map((_, i) => i)).k;
+      this.fitK = this.frameOf().k;
       if (restore) this.jump(restore); else this.fit(false);
     }
-    this.intro = this.reduced ? 1 : 0;
     this.invalidate();
   }
 
   /** Swaps in a new arrangement of the same library: images glide from where they were to where they now belong. */
   morph(points: MapPoint[], refit: boolean) {
-    if (!this.points.length || this.reduced) { this.setPoints(points, refit ? undefined : this.camera); return; }
+    if (!this.points.length || this.reduced || !this.hasAtlas || !points.some(point => point.slot >= 0)) {
+      this.setPoints(points, refit ? undefined : this.camera);
+      return;
+    }
     const before = new Map(this.points.map(p => [p.id, p]));
     const selected = this.selected >= 0 ? this.points[this.selected].id : null;
     // The engine owns these copies: their coordinates change every frame.
-    this.points = points.map(p => ({ ...p })); this.scene++;
+    this.points = points.map(p => ({ ...p }));
     this.index = new Map(this.points.map((p, i) => [p.id, i]));
     this.sx = new Float32Array(points.length); this.sy = new Float32Array(points.length);
-    this.hovered = -1; this.lift.clear(); this.members = null; this.dim = 0;
+    this.hovered = -1; this.lift.clear(); this.members = null;
     this.selected = selected ? this.index.get(selected) ?? -1 : -1;
     if (this.selected < 0 && selected) this.calls.onSelect(null);
     this.measure();
-    if (this.w) { this.fitK = this.frameOf(this.points.map((_, i) => i)).k; if (refit) this.fit(true); }
-    this.morphFrom = new Float32Array(points.length * 2); this.morphTo = new Float32Array(points.length * 2);
+    if (this.w) { this.fitK = this.frameOf().k; if (refit) this.fit(true); }
+    this.morphFrom = new Float64Array(points.length * 2); this.morphTo = new Float64Array(points.length * 2);
     this.points.forEach((p, i) => {
       const old = before.get(p.id);
       this.morphFrom.set([old ? old.x : p.x, old ? old.y : p.y], i * 2); this.morphTo.set([p.x, p.y], i * 2);
@@ -171,9 +183,12 @@ export class MapEngine {
 
   setHighlight(ids: string[] | null) {
     const set = ids && new Set(ids.map(id => this.index.get(id)).filter((i): i is number => i !== undefined));
-    // A search that matched nothing fades every image.
-    this.members = set; this.scene++;
-    if (set?.size) this.flyTo([...set]);
+    // Refreshing the same points (for example when an atlas arrives) keeps the user's camera.
+    const previous = this.highlightedIds;
+    const changed = ids !== previous && (ids?.length !== previous?.length || ids?.some((id, i) => id !== previous?.[i]));
+    this.highlightedIds = ids;
+    this.members = set;
+    if (changed && set?.size) this.flyTo([...set]);
     this.invalidate();
   }
 
@@ -182,24 +197,32 @@ export class MapEngine {
     const n = Math.max(1, this.points.length);
     this.base = clamp(0.6 * Math.sqrt((this.w * this.h) / n), 20, 64);
     if (!this.points.length) return;
-    const xs = this.points.map(p => p.x).sort((a, b) => a - b), ys = this.points.map(p => p.y).sort((a, b) => a - b);
-    this.bounds = { minX: xs[0], maxX: xs[xs.length - 1], minY: ys[0], maxY: ys[ys.length - 1] };
+    this.bounds = this.boundsOf();
   }
 
   // ---- Camera ----------------------------------------------------------------------------------
 
-  private frameOf(indices: number[]): Camera {
+  private boundsOf(indices?: number[]) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    const count = indices?.length ?? this.points.length;
+    for (let i = 0; i < count; i++) {
+      const { x, y } = this.points[indices ? indices[i] : i];
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    }
+    return { minX, maxX, minY, maxY };
+  }
+
+  private frameOf(indices?: number[]): Camera {
     const pad = clamp(Math.min(this.w, this.h) * 0.07, 20, 72) + this.base / 2;
-    const xs = indices.map(i => this.points[i].x).sort((a, b) => a - b);
-    const ys = indices.map(i => this.points[i].y).sort((a, b) => a - b);
-    const minX = xs[0], maxX = xs[xs.length - 1], minY = ys[0], maxY = ys[ys.length - 1];
+    const { minX, maxX, minY, maxY } = indices ? this.boundsOf(indices) : this.bounds;
     const k = Math.min((this.w - 2 * pad) / Math.max(maxX - minX, 1e-6), (this.h - 2 * pad) / Math.max(maxY - minY, 1e-6));
     return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, k };
   }
 
   fit(animated = true) {
     if (!this.points.length || !this.w) return;
-    const frame = this.frameOf(this.points.map((_, i) => i));
+    const frame = this.frameOf();
     this.fitK = frame.k;
     this.travel(frame, animated);
   }
@@ -216,15 +239,19 @@ export class MapEngine {
     this.invalidate();
   }
 
+  private clampScale(k: number) {
+    return clamp(k, this.fitK * MIN_ZOOM, Math.max(this.fitK, MAX_WORLD_SCALE));
+  }
+
   jump(camera: MapCamera) {
-    const k = clamp(this.fitK * camera.zoom, this.fitK * MIN_ZOOM, this.fitK * MAX_ZOOM);
+    const k = this.clampScale(this.fitK * camera.zoom);
     this.travel({ x: camera.x, y: camera.y, k }, false);
   }
 
   get camera(): MapCamera { return { x: this.goal.x, y: this.goal.y, zoom: this.goal.k / this.fitK }; }
 
   zoomBy(factor: number, mx = this.w / 2, my = this.h / 2, instant = false) {
-    const k = clamp(this.goal.k * factor, this.fitK * MIN_ZOOM, this.fitK * MAX_ZOOM);
+    const k = this.clampScale(this.goal.k * factor);
     const wx = (mx - this.w / 2) / this.goal.k + this.goal.x, wy = (my - this.h / 2) / this.goal.k + this.goal.y;
     this.goal = { k, x: wx - (mx - this.w / 2) / k, y: wy - (my - this.h / 2) / k };
     this.flight = false; this.glide = { vx: 0, vy: 0 };
@@ -247,7 +274,9 @@ export class MapEngine {
     g.y = clamp(g.y, b.minY - this.h / g.k * 0.4, b.maxY + this.h / g.k * 0.4);
   }
 
-  private iconSize(k = this.cam.k) { return Math.min(MAX_ICON, this.base * Math.sqrt(k / this.fitK)); }
+  private iconSize(k = this.cam.k) {
+    return Math.min(MAX_ICON, this.base * Math.sqrt(k / this.fitK));
+  }
 
   // ---- Selection -------------------------------------------------------------------------------
 
@@ -297,7 +326,7 @@ export class MapEngine {
     this.points.forEach((p, i) => {
       if (i === start || (this.members && !this.members.has(i))) return;
       const ax = p.x - from.x, ay = p.y - from.y, along = ax * dx + ay * dy, across = Math.abs(ax * dy - ay * dx);
-      if (along <= 1e-6 || across > along * 1.2) return;
+      if (along <= 0 || across > along * 1.2) return;
       const score = along + across * 0.6;
       if (score < bestScore) { bestScore = score; best = i; }
     });
@@ -322,9 +351,10 @@ export class MapEngine {
     const r = this.canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   }
-  private onChrome(e: Event) { return (e.target as HTMLElement).closest?.('.map-controls, button, a') !== null; }
+  private onChrome(e: Event) { return !!(e.target as Element).closest?.('.map-controls, .map-nearby, button, a'); }
 
   private wheel = (e: WheelEvent) => {
+    if (this.onChrome(e)) return;
     e.preventDefault();
     const { x, y } = this.local(e);
     const delta = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
@@ -365,6 +395,7 @@ export class MapEngine {
   }
 
   private move = (e: PointerEvent) => {
+    if (!this.drag && this.onChrome(e)) return;
     const p = this.local(e);
     if (this.touches.has(e.pointerId)) this.touches.set(e.pointerId, p);
     if (this.pinch && this.touches.size >= 2) {
@@ -404,7 +435,7 @@ export class MapEngine {
       this.calls.onCarry(this.points[d.grabbed].id, e.clientX, e.clientY, true);
     } else if (!d.moved) {
       const i = this.hit(p.x, p.y);
-      if (i >= 0) this.calls.onOpen(this.points[i].id); else this.select(null);
+      if (i >= 0) this.openPoint(i); else this.select(null);
     } else if (!this.reduced && e.timeStamp - d.t < 80 && Math.hypot(d.vx, d.vy) > 0.05) {
       this.glide = { vx: d.vx, vy: d.vy }; this.invalidate();
     }
@@ -424,13 +455,35 @@ export class MapEngine {
 
   // ---- Hit testing and hover -------------------------------------------------------------------
 
-  /** Topmost image under a screen position. The image already lifted is tested at its lifted size. */
+  /** Prefer an image's point center, even when another image's preview overlaps it. */
   private hit(x: number, y: number) {
-    const size = this.iconSize();
-    const inside = (i: number, s: number) => Math.abs(x - this.sx[i]) <= s / 2 && Math.abs(y - this.sy[i]) <= s / 2;
-    if (this.hovered >= 0 && inside(this.hovered, this.liftedSize(this.hovered, size))) return this.hovered;
-    for (let n = this.order.length - 1; n >= 0; n--) if (inside(this.order[n], size)) return this.order[n];
+    let closest = -1, distance = POINT_RADIUS ** 2;
+    for (let n = this.order.length - 1; n >= 0; n--) {
+      const i = this.order[n], d = (this.sx[i] - x) ** 2 + (this.sy[i] - y) ** 2;
+      if (d < distance) { closest = i; distance = d; }
+    }
+    if (closest >= 0) return closest;
+    for (let n = this.previews.length - 1; n >= 0; n--) {
+      const { point, size } = this.previews[n];
+      if (Math.abs(x - this.sx[point]) <= size / 2 && Math.abs(y - this.sy[point]) <= size / 2) return point;
+    }
     return -1;
+  }
+
+  openSelected() {
+    if (this.selected >= 0) this.openPoint(this.selected);
+  }
+
+  private openPoint(point: number) {
+    const x = this.sx[point], y = this.sy[point];
+    const nearby = [this.points[point].id];
+    // Topmost first after the selected image, so highlighted images retain their existing priority.
+    for (let n = this.order.length - 1; n >= 0; n--) {
+      const i = this.order[n];
+      if (i !== point && (this.sx[i] - x) ** 2 + (this.sy[i] - y) ** 2 <= POINT_RADIUS ** 2) nearby.push(this.points[i].id);
+    }
+    if (nearby.length > 1) this.calls.onNearby(nearby);
+    else this.calls.onOpen(nearby[0]);
   }
 
   private setHover(i: number) {
@@ -452,7 +505,7 @@ export class MapEngine {
     const dt = Math.min(48, this.last ? now - this.last : 16); this.last = now; this.clock = now;
     const busy = this.update(dt);
     this.draw();
-    if (busy) this.invalidate(); else { this.last = 0; this.settled(); }
+    if (busy || this.pendingThumbs) this.invalidate(); else { this.last = 0; this.settled(); }
   };
 
   private update(dt: number) {
@@ -477,22 +530,19 @@ export class MapEngine {
       if (Math.abs(ex) * cam.k > 0.2 || Math.abs(ey) * cam.k > 0.2) { cam.x += ex * a; cam.y += ey * a; busy = true; } else { cam.x = goal.x; cam.y = goal.y; this.flight = false; }
     }
     if (this.anchor) busy = true;
-    const dimGoal = this.members ? 1 : this.selected >= 0 ? 0.18 : 0;
-    if (Math.abs(dimGoal - this.dim) > 0.003) { this.dim += (dimGoal - this.dim) * (this.reduced ? 1 : approach(150, dt)); busy = true; } else this.dim = dimGoal;
     if (this.morphing < 1) {
       this.morphing = Math.min(1, this.morphing + dt / 700);
       const eased = 1 - Math.pow(1 - this.morphing, 3), { morphFrom: a, morphTo: b } = this;
       this.points.forEach((p, i) => { p.x = a[i * 2] + (b[i * 2] - a[i * 2]) * eased; p.y = a[i * 2 + 1] + (b[i * 2 + 1] - a[i * 2 + 1]) * eased; });
       busy = true;
     }
-    if (this.intro < 1) { this.intro = Math.min(1, this.intro + dt / 900); busy = true; }
     for (const [i, t] of this.lift) {
       const goalLift = i === this.hovered ? 1 : 0;
       const next = this.reduced ? goalLift : t + (goalLift - t) * approach(70, dt);
       if (goalLift === 0 && next < 0.01) this.lift.delete(i); else { this.lift.set(i, Math.abs(goalLift - next) < 0.005 ? goalLift : next); if (this.lift.get(i) !== goalLift) busy = true; }
     }
     if (this.pointer && !this.drag && busy) this.setHover(this.hit(this.pointer.x, this.pointer.y));
-    return busy || this.pendingThumbs;
+    return busy;
   }
 
   private settled() {
@@ -512,23 +562,100 @@ export class MapEngine {
     ctx.clearRect(0, 0, w, h);
     // Set again by any thumbnail still fading in or waiting to load, which keeps frames coming.
     this.pendingThumbs = false;
-    const size = this.iconSize(), half = size / 2, sharp = size * dpr > SHARP_AT;
+    const size = this.iconSize();
     for (let i = points.length - 1; i >= 0; i--) {
       this.sx[i] = (points[i].x - cam.x) * cam.k + w / 2; this.sy[i] = (points[i].y - cam.y) * cam.k + h / 2;
     }
-    this.order = this.stack(half, 0);
-    // Zoomed out, where thousands of icons show, a still scene is drawn once and moved as a whole while panning.
-    if (!sharp && cam.k === this.goal.k && this.intro >= 1 && this.morphing >= 1) this.layered(size);
-    else this.paint(ctx, this.order, size, sharp);
-    const raised = [...this.lift.keys()].filter(i => this.sx[i] > -size && this.sx[i] < w + size).sort((a, b) => this.lift.get(a)! - this.lift.get(b)!);
-    for (const i of raised) { const s = this.liftedSize(i, size); this.tile(ctx, i, s, 1, this.lift.get(i)!, s * dpr > SHARP_AT); }
-    ctx.globalAlpha = 1;
-    if (sharp) this.requestThumbs(size);
+    this.order = this.stack(size / 2);
+    this.drawPreviews(size);
+    this.drawPoints(new Set(this.previews.map(preview => preview.point)));
   }
 
-  /** Images within `margin` of the view, bottom to top: faded ones under lit ones. */
-  private stack(half: number, margin: number) {
-    const lit: number[] = [], faded: number[] = [], lo = -half - margin, right = this.w + half + margin, bottom = this.h + half + margin;
+  /** Draw a bounded set of previews with the same spacing for cached thumbnails and atlas icons. */
+  private drawPreviews(size: number) {
+    const { ctx, w, h } = this;
+    const arranged: Preview[] = [];
+    const place = (point: number, previewSize: number, focused: boolean) => {
+      const x = this.sx[point], y = this.sy[point];
+      if (arranged.some(other => {
+        const gap = (previewSize + other.size) / 2 + PREVIEW_GAP;
+        return Math.abs(x - this.sx[other.point]) < gap && Math.abs(y - this.sy[other.point]) < gap;
+      })) return;
+      arranged.push({ point, size: previewSize, focused });
+    };
+    const focus = [this.hovered, this.selected].filter((i, n, all) =>
+      i >= 0 && all.indexOf(i) === n && this.sx[i] >= 0 && this.sx[i] <= w && this.sy[i] >= 0 && this.sy[i] <= h);
+    for (const i of focus) place(i, Math.max(36, this.liftedSize(i, size)), true);
+
+    if (this.hasAtlas || this.cam.k / this.fitK >= PREVIEW_ZOOM) {
+      // Pick one candidate per cell, then check its exact bounds against the cards already placed.
+      const candidates: number[] = [], occupied = new Set<number>();
+      const cell = Math.max(32, size * 0.8), stride = Math.ceil(w / cell) + 1;
+      for (let n = this.order.length - 1; n >= 0; n--) {
+        const i = this.order[n], x = this.sx[i], y = this.sy[i];
+        if (x < 0 || x > w || y < 0 || y > h || focus.includes(i) || (this.members && !this.members.has(i))) continue;
+        const bin = Math.floor(y / cell) * stride + Math.floor(x / cell);
+        if (!occupied.has(bin)) { occupied.add(bin); candidates.push(i); }
+      }
+      const distance = (i: number) => (this.sx[i] - w / 2) ** 2 + (this.sy[i] - h / 2) ** 2;
+      candidates.sort((a, b) => distance(a) - distance(b));
+      for (const i of candidates) {
+        if (arranged.length >= MAX_PREVIEWS) break;
+        place(i, size, false);
+      }
+    }
+    // Hovered and selected points load immediately. Wait until the camera stops before loading its new viewport.
+    const arrived = this.cam.k === this.goal.k && this.cam.x === this.goal.x && this.cam.y === this.goal.y && !this.drag;
+    for (const preview of arranged) {
+      if (this.loading >= MAX_LOADS) break;
+      if (!arrived && !preview.focused) continue;
+      const point = this.points[preview.point];
+      if ((!this.sheet(point) || preview.size * this.dpr > SHARP_AT)
+        && this.outgrown(this.thumbs.get(point.id), preview.size)) this.load(point.id, preview.size);
+    }
+    this.previews = arranged.reverse().filter(({ point, focused }) =>
+      focused || this.sheet(this.points[point]) || this.thumbs.get(this.points[point].id)?.bitmap);
+    for (const { point, size: previewSize, focused } of this.previews) {
+      this.tile(ctx, point, previewSize, focused ? this.lift.get(point) ?? 0 : 0);
+    }
+  }
+
+  /** Draw points not represented by a preview above the cards so even a covered point stays visible. */
+  private drawPoints(represented: Set<number>) {
+    const { ctx, w, h } = this;
+    const columns = Math.ceil(w / DOT_CELL), rows = Math.ceil(h / DOT_CELL);
+    if (!columns || !rows) return;
+    if (this.dots?.pixels.width !== columns || this.dots.pixels.height !== rows) {
+      const canvas = document.createElement('canvas');
+      canvas.width = columns; canvas.height = rows;
+      const context = canvas.getContext('2d')!;
+      this.dots = { context, pixels: context.createImageData(columns, rows) };
+    }
+    const { context, pixels } = this.dots;
+    const rgba = pixels.data, dark = document.documentElement.dataset.theme === 'dark';
+    const neutral = dark ? 202 : 71;
+    rgba.fill(0);
+    for (let n = this.order.length - 1; n >= 0; n--) {
+      const i = this.order[n], x = Math.floor(this.sx[i] / DOT_CELL), y = Math.floor(this.sy[i] / DOT_CELL);
+      if (x < 0 || x >= columns || y < 0 || y >= rows || represented.has(i)) continue;
+      const offset = (y * columns + x) * 4;
+      if (rgba[offset + 3]) continue;
+      const member = this.members?.has(i);
+      rgba[offset] = member ? (dark ? 137 : 40) : neutral;
+      rgba[offset + 1] = member ? (dark ? 182 : 101) : neutral;
+      rgba[offset + 2] = member ? (dark ? 255 : 202) : neutral;
+      rgba[offset + 3] = member ? 245 : this.members ? 55 : 175;
+    }
+    context.putImageData(pixels, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(context.canvas, 0, 0, columns * DOT_CELL, rows * DOT_CELL);
+    ctx.imageSmoothingEnabled = true;
+  }
+
+  /** Visible images, bottom to top: faded ones under lit ones. */
+  private stack(half: number) {
+    const lit: number[] = [], faded: number[] = [], lo = -half, right = this.w + half, bottom = this.h + half;
     for (let i = this.points.length - 1; i >= 0; i--) {
       const x = this.sx[i], y = this.sy[i];
       if (x < lo || x > right || y < lo || y > bottom) continue;
@@ -537,66 +664,28 @@ export class MapEngine {
     return faded.concat(lit);
   }
 
-  private paint(ctx: CanvasRenderingContext2D, order: number[], size: number, sharp: boolean) {
-    const mute = 1 - (1 - DIMMED) * this.dim, points = this.points;
-    for (const i of order) {
-      const receded = this.members ? !this.members.has(i) && i !== this.selected : this.selected >= 0 && i !== this.selected;
-      // A radial bloom on arrival: the centre of the map appears first.
-      const r = Math.min(1, Math.hypot(points[i].x, points[i].y)), t = clamp(this.intro * 1.6 - r * 0.6, 0, 1), eased = 1 - Math.pow(1 - t, 3);
-      // Whatever is not being looked at shrinks to fine dust, so the lit images read as figures on a ground.
-      const scale = (receded && this.members ? 1 - (1 - RECEDED) * this.dim : 1) * (this.intro >= 1 ? 1 : 0.6 + 0.4 * eased);
-      this.tile(ctx, i, size * scale, (receded ? mute : 1) * (this.intro >= 1 ? 1 : eased), 0, sharp && !receded);
-    }
+  private sheet(point: MapPoint) {
+    return this.sheets[Math.floor(point.slot / PER_SHEET)];
   }
 
-  /** Draws the icons from a layer reaching LAYER_MARGIN past each edge of the view, redrawing it only when the scene
-   *  changes or a pan uncovers images it doesn't hold. It is placed on whole device pixels, so icons stay as crisp as
-   *  when drawn directly. */
-  private layered(size: number) {
-    const { cam, w, h, dpr } = this, width = Math.round((w + 2 * LAYER_MARGIN) * dpr), height = Math.round((h + 2 * LAYER_MARGIN) * dpr);
-    const key = `${cam.k} ${this.dim} ${this.selected} ${this.scene} ${width} ${height}`;
-    let layer = this.layer, dx = 0, dy = 0;
-    if (layer?.key === key) { dx = (layer.x - cam.x) * cam.k; dy = (layer.y - cam.y) * cam.k; }
-    if (layer?.key !== key || this.uncovered(dx, dy, size / 2)) {
-      layer ??= this.layer = { canvas: document.createElement('canvas'), key, x: 0, y: 0 };
-      const { canvas } = layer;
-      if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
-      const ctx = canvas.getContext('2d')!;
-      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, width, height);
-      ctx.setTransform(dpr, 0, 0, dpr, LAYER_MARGIN * dpr, LAYER_MARGIN * dpr);
-      this.paint(ctx, this.stack(size / 2, LAYER_MARGIN), size, false);
-      Object.assign(layer, { key, x: cam.x, y: cam.y }); dx = dy = 0;
-    }
-    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.drawImage(layer.canvas, Math.round((dx - LAYER_MARGIN) * dpr), Math.round((dy - LAYER_MARGIN) * dpr));
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
-
-  /** Whether the view shows part of the map beyond a layer drawn (dx, dy) away from the current camera. */
-  private uncovered(dx: number, dy: number, half: number) {
-    const { cam, w, h, bounds: b } = this;
-    const left = (b.minX - cam.x) * cam.k + w / 2 - half, right = (b.maxX - cam.x) * cam.k + w / 2 + half;
-    const top = (b.minY - cam.y) * cam.k + h / 2 - half, bottom = (b.maxY - cam.y) * cam.k + h / 2 + half;
-    return (dx > LAYER_MARGIN && left < dx - LAYER_MARGIN) || (dx < -LAYER_MARGIN && right > w + dx + LAYER_MARGIN)
-      || (dy > LAYER_MARGIN && top < dy - LAYER_MARGIN) || (dy < -LAYER_MARGIN && bottom > h + dy + LAYER_MARGIN);
-  }
-
-  private tile(ctx: CanvasRenderingContext2D, i: number, size: number, alpha: number, lift: number, sharp: boolean) {
-    const p = this.points[i], sheet = this.sheets[Math.floor(p.slot / PER_SHEET)];
-    if (!sheet || alpha <= 0.004) return;
+  private tile(ctx: CanvasRenderingContext2D, i: number, size: number, lift: number) {
+    const p = this.points[i], sheet = this.sheet(p), thumb = this.thumbs.get(p.id);
     const cell = p.slot % PER_SHEET, x = this.sx[i] - size / 2, y = this.sy[i] - size / 2;
-    ctx.globalAlpha = alpha;
+    ctx.globalAlpha = 1;
     if (lift > 0) { ctx.shadowColor = 'rgba(0,0,0,.22)'; ctx.shadowBlur = 24 * lift; ctx.shadowOffsetY = 8 * lift; }
-    ctx.drawImage(sheet, (cell % COLUMNS) * CELL + INSET, Math.floor(cell / COLUMNS) * CELL + INSET, INNER, INNER, x, y, size, size);
+    if (sheet) ctx.drawImage(sheet, (cell % COLUMNS) * CELL + INSET, Math.floor(cell / COLUMNS) * CELL + INSET, INNER, INNER, x, y, size, size);
+    else if (i === this.selected || i === this.hovered) {
+      ctx.fillStyle = 'rgba(110,117,128,.68)';
+      ctx.beginPath(); ctx.roundRect(x, y, size, size, size * CORNER); ctx.fill();
+    }
     if (lift > 0) { ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0; }
-    const thumb = sharp ? this.thumb(p.id, size) : null;
-    if (thumb) {
+    if (thumb?.bitmap) {
       thumb.used = this.clock;
       const fade = clamp((this.clock - thumb.shown) / 200, 0, 1);
       ctx.save();
       ctx.beginPath(); ctx.roundRect(x, y, size, size, size * CORNER); ctx.clip();
-      ctx.globalAlpha = alpha * fade;
-      ctx.drawImage(thumb.bitmap!, x, y, size, size);
+      ctx.globalAlpha = fade;
+      ctx.drawImage(thumb.bitmap, x, y, size, size);
       ctx.restore();
       if (fade < 1) this.pendingThumbs = true;
     }
@@ -617,42 +706,42 @@ export class MapEngine {
 
   // ---- Sharp thumbnails ------------------------------------------------------------------------
 
-  /** The sharp thumbnail of an image drawn `size` wide, once one has loaded. A sharper one loads when the icon outgrows it. */
-  private thumb(id: string, size: number) {
-    const found = this.thumbs.get(id);
-    if (this.loading < MAX_LOADS && this.outgrown(found, size)) this.load(id, size);
-    return found?.bitmap ? found : null;
-  }
-
   private outgrown(thumb: Thumb | undefined, size: number) { return !thumb || (!thumb.loading && thumb.resolution < resolution(size * this.dpr)); }
 
   private load(id: string, size: number) {
+    if (!this.thumbs.has(id) && this.thumbs.size >= MAX_THUMBS) {
+      let oldest: string | undefined, used = Infinity;
+      for (const [key, thumb] of this.thumbs) {
+        if (!thumb.loading && thumb.used < used) { oldest = key; used = thumb.used; }
+      }
+      if (oldest === undefined) return;
+      this.thumbs.get(oldest)?.bitmap?.close();
+      this.thumbs.delete(oldest);
+    }
     const entry = this.thumbs.get(id) ?? { bitmap: null, resolution: 0, loading: false, shown: 0, used: this.clock };
     const wanted = entry.resolution = resolution(size * this.dpr);
     entry.loading = true; this.thumbs.set(id, entry); this.loading++;
     // Decoded off the main thread, cropped to the square the map shows at about the size it is drawn, and kept decoded:
     // a canvas would otherwise decode the full thumbnail mid-frame, and again whenever the browser discarded it.
-    fetch(imageUrl(id)).then(response => response.blob()).then(createImageBitmap).then(async full => {
+    fetch(imageUrl(id), { signal: this.thumbRequests.signal }).then(response => {
+      if (!response.ok) throw new Error('Preview unavailable');
+      return response.blob();
+    }).then(createImageBitmap).then(async full => {
       const side = Math.min(full.width, full.height), target = Math.min(side, wanted);
-      const bitmap = await createImageBitmap(full, (full.width - side) / 2, (full.height - side) / 2, side, side, { resizeWidth: target, resizeHeight: target, resizeQuality: 'high' });
-      full.close();
+      let bitmap: ImageBitmap;
+      try {
+        bitmap = await createImageBitmap(full, (full.width - side) / 2, (full.height - side) / 2, side, side, { resizeWidth: target, resizeHeight: target, resizeQuality: 'high' });
+      } finally {
+        full.close();
+      }
       if (this.thumbs.get(id) !== entry) { bitmap.close(); return; }
       if (!entry.bitmap) entry.shown = performance.now();
       entry.bitmap?.close(); entry.bitmap = bitmap; this.invalidate();
-    }).catch(() => {}).finally(() => { entry.loading = false; this.loading--; });
-    if (this.thumbs.size > MAX_THUMBS) {
-      const stale = [...this.thumbs.entries()].filter(([, t]) => t.bitmap && !t.loading && t.used < this.clock - 1000).sort((a, b) => a[1].used - b[1].used).slice(0, MAX_THUMBS / 4);
-      for (const [key, thumb] of stale) { thumb.bitmap!.close(); this.thumbs.delete(key); }
-    }
-  }
-
-  /** Fetch sharp thumbnails for what is on screen, nearest to the middle first. */
-  private requestThumbs(size: number) {
-    if (this.loading >= MAX_LOADS) { this.pendingThumbs = true; return; }
-    const cx = this.w / 2, cy = this.h / 2;
-    const want = this.order.filter(i => this.outgrown(this.thumbs.get(this.points[i].id), size)).sort((a, b) => Math.hypot(this.sx[a] - cx, this.sy[a] - cy) - Math.hypot(this.sx[b] - cx, this.sy[b] - cy));
-    for (const i of want.slice(0, MAX_LOADS - this.loading)) this.load(this.points[i].id, size);
-    if (want.length) this.pendingThumbs = true;
+    }).catch(() => {}).finally(() => {
+      entry.loading = false;
+      this.loading--;
+      if (this.thumbs.get(id) === entry) this.invalidate();
+    });
   }
 
   // ---- Keyboard --------------------------------------------------------------------------------

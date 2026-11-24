@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowUpRight, Check, ChevronDown, Copy, FolderOpen, Image as ImageIcon, Images, X } from 'lucide-react';
+import { ArrowUpRight, Check, ChevronDown, Copy, FolderOpen, Image as ImageIcon, Images, RotateCw, X } from 'lucide-react';
 import type { Facets, Filters, LibraryStatus, Model, Range, SearchCondition, SearchMode, Status, Updates } from './types';
 import { APP_NAME, RANGES, SET_UP, megabytes, post, request, typeLabel } from './types';
 import { waitingOn } from './Activity';
@@ -199,8 +199,26 @@ export function FolderChooser({ status, offerSetup, onOpened, onSetUp }: { statu
 }
 
 export function FolderPanel({ status, anchor, onOpened, onClose }: { status: Status; anchor: HTMLElement | null; onOpened: (status: Status) => void; onClose: () => void }) {
+  const [starting, setStarting] = useState(false);
+  const [scanError, setScanError] = useState('');
+  const rescan = async () => {
+    setStarting(true); setScanError('');
+    try {
+      await post('/api/scan');
+      onOpened(await request<Status>('/api/status'));
+      onClose();
+    } catch (e) {
+      setScanError((e as Error).message);
+    } finally {
+      setStarting(false);
+    }
+  };
   return <Panel title="Folder" anchor={anchor} onClose={onClose}>
-    {status.folder && <p>Showing <span className="path">{status.folder.label}</span>.</p>}
+    {status.folder && <>
+      <p>Showing <span className="path">{status.folder.label}</span>.</p>
+      <button className="text-button secondary" disabled={starting || status.library?.scan.state === 'scanning'} onClick={() => void rescan()}><RotateCw />Rescan folder</button>
+      {scanError && <p className="error-copy" role="alert">{scanError}</p>}
+    </>}
     <FolderChooser status={status} onOpened={next => { onOpened(next); if (next.folder?.id !== status.folder?.id) onClose(); }} />
   </Panel>;
 }

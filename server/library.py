@@ -1,4 +1,5 @@
 """One folder's library: its scan, visual index, map, and the queries the API answers from them."""
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta, timezone
 import json
 import logging
@@ -21,8 +22,10 @@ PAGE_SIZE = 80
 # The most one request returns, so a jump far down the timeline loads the pages above it in a few requests.
 MAX_PAGE = 2500
 IMAGE_ID = re.compile(r'^[a-f0-9]{64}$')
-# The most images the map shows, the newest. Each is a decoded icon in the page, and drawn every frame.
-MAP_LIMIT = 25_000
+# The most images the map shows, the newest.
+MAP_LIMIT = 200_000
+# Large views open as points and load thumbnails on demand. Each atlas sheet would occupy 16 MiB decoded.
+MAP_ATLAS_LIMIT = 4_096
 # Browsers show these directly. Anything else is viewed as a converted JPEG.
 WEB_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'}
 # Matches every video's mime type in SQL.
@@ -80,16 +83,25 @@ class Library:
         self.scan_state = {'state': 'ready'}
         # Bumped whenever a scan commits or the groups change, so open pages know to refresh.
         self.revision = 0
-        # The date-ordered tiles for the last filters asked, at the revision they were read, so scrolling, jumping
-        # down the timeline and the timeline itself page through one list instead of each grouping every image.
-        self._tiles = None
+        # Keep two date-ordered views so switching between a folder and All reuses both lists.
+        self._tiles_revision = self.revision
+        self._tiles = OrderedDict()
         self._tiles_lock = threading.Lock()
+        self._facets = None
+        self._facets_lock = threading.Lock()
         self.stats_path = self.directory / 'scan-status.json'
         try:
             self.stats = json.loads(self.stats_path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             self.stats = {}
         (self.directory / 'folder.txt').write_text(str(self.folder) + '\n', encoding='utf-8')
+
+    def has_catalog(self) -> bool:
+        """A completed scan or a partially populated catalog can be shown straight from the cache."""
+        if self.stats.get('updated'):
+            return True
+        with connect(self.directory) as db:
+            return db.execute('SELECT 1 FROM files LIMIT 1').fetchone() is not None
 
     def close(self):
         """Stop background work for a folder that is no longer shown."""
@@ -158,7 +170,8 @@ class Library:
             videos = db.execute('SELECT count(*) FROM images WHERE mime LIKE ?', (VIDEO_MIMES,)).fetchone()[0]
             files = db.execute('SELECT count(*) FROM files WHERE image_id IS NOT NULL').fetchone()[0]
             unreadable_count = db.execute('SELECT count(*) FROM files WHERE error IS NOT NULL').fetchone()[0]
-            near = db.execute('SELECT count(*) - count(DISTINCT group_id) FROM image_groups WHERE image_id IN (SELECT id FROM images)').fetchone()[0]
+            near = db.execute('''SELECT count(*) - count(DISTINCT g.group_id)
+                                 FROM image_groups g CROSS JOIN images i ON i.id=g.image_id''').fetchone()[0]
         return {'counts': {'images': images, 'videos': videos, 'files': files, 'duplicates': files - images, 'nearDuplicates': near, 'unreadable': unreadable_count},
                 'unlistedFolders': self.stats.get('unlisted_folders', 0), 'unreached': self.stats.get('unreached', 0),
                 'photoLibraries': self.stats.get('photo_libraries', []),
@@ -182,8 +195,9 @@ class Library:
         where, values = ['f.image_id IS NOT NULL'], []
         folder = params.get('folder', '').strip('/')
         if folder:
-            where.append('(f.folder=? OR substr(f.folder,1,?)=?)')
-            values += [folder, len(folder) + 1, folder + '/']
+            # In SQLite's binary order, '0' immediately follows '/', bounding the descendant prefix.
+            where.append('(f.folder=? OR (f.folder>=? AND f.folder<?))')
+            values += [folder, folder + '/', folder + '0']
         if params.get('type'):
             if params['type'] not in TYPES:
                 raise ValueError('Choose a file type from the list.')
@@ -209,14 +223,62 @@ class Library:
         if not collapse:
             return self._read_tiles(where, values, collapse)
         # Read before the query, so rows a scan commits meanwhile are at worst read again.
-        key = (self.revision, tuple(where), tuple(values))
         with self._tiles_lock:
-            if self._tiles is None or self._tiles[0] != key:
-                self._tiles = (key, self._read_tiles(where, values, collapse))
-            return self._tiles[1]
+            if self._tiles_revision != self.revision:
+                self._tiles_revision = self.revision
+                self._tiles.clear()
+            key = (tuple(where), tuple(values))
+            if key not in self._tiles:
+                if len(self._tiles) == 2:
+                    self._tiles.popitem(last=False)
+                self._tiles[key] = self._read_tiles(where, values, collapse)
+            self._tiles.move_to_end(key)
+            return self._tiles[key]
+
+    def _collapsed_tiles(self, condition, values):
+        # Read each matching file once. Two full SQLite window sorts are costly even when almost all images are singletons.
+        sql = f"""SELECT i.id,i.width,i.height,i.mime,i.size,i.duration,coalesce(i.taken,f.modified) AS date,
+                         CASE WHEN i.taken IS NULL THEN 'modified' ELSE 'taken' END AS dated,
+                         f.path,coalesce(g.group_id,f.image_id) AS "group",coalesce(g.score,0) AS score
+                  FROM files f JOIN images i ON i.id=f.image_id LEFT JOIN image_groups g ON g.image_id=f.image_id
+                  WHERE {condition}"""
+        images = {}
+        with connect(self.directory, rows=True) as db:
+            for row in db.execute(sql, values):
+                previous = images.get(row['id'])
+                if previous is None:
+                    images[row['id']] = row, 1
+                    continue
+                best, copies = previous
+                if row['date'] > best['date'] or (row['date'] == best['date'] and row['path'] < best['path']):
+                    best = row
+                images[row['id']] = best, copies + 1
+
+        groups = {}
+        for row, copies in images.values():
+            previous = groups.get(row['group'])
+            if previous is None:
+                groups[row['group']] = row, copies, 1
+                continue
+            best, best_copies, members = previous
+            priority, best_priority = (row['score'], row['date']), (best['score'], best['date'])
+            if priority > best_priority or (priority == best_priority and row['id'] < best['id']):
+                best, best_copies = row, copies
+            groups[row['group']] = best, best_copies, members + 1
+
+        ordered = sorted(groups.values(), key=lambda entry: entry[0]['id'])
+        ordered.sort(key=lambda entry: entry[0]['date'], reverse=True)
+        rows = []
+        for row, copies, members in ordered:
+            tile = dict(row, copies=copies, members=members)
+            del tile['score']
+            rows.append(tile)
+        return rows
 
     def _read_tiles(self, where, values, collapse):
         condition = ' AND '.join(where)
+        if collapse:
+            return self._collapsed_tiles(condition, values)
         # Photos are dated when they were taken, and anything without EXIF by when its file was modified.
         matching = f'''WITH matching AS (
             SELECT f.path, f.image_id, f.modified, coalesce(i.taken, f.modified) AS date,
@@ -230,10 +292,9 @@ class Library:
                    count(*) OVER (PARTITION BY grp) AS members
             FROM matching WHERE rank=1
         )'''
-        shown = 'WHERE p.place=1 ORDER BY p.date DESC,i.id' if collapse else 'ORDER BY p.place'
         sql = f'''{matching} SELECT i.id,i.width,i.height,i.mime,i.size,i.duration,p.date,CASE WHEN i.taken IS NULL THEN 'modified' ELSE 'taken' END AS dated,
                          p.path,p.copies,p.grp AS "group",p.members
-                  FROM images i JOIN pictures p ON p.image_id=i.id {shown}'''
+                  FROM images i JOIN pictures p ON p.image_id=i.id ORDER BY p.place'''
         # Grouping needs every matching row, so SQL can't page this any cheaper than slicing the whole list.
         with connect(self.directory, rows=True) as db:
             return db.execute(sql, values).fetchall()
@@ -297,19 +358,25 @@ class Library:
         """The folder, its subfolders and the file types present, each with how many tiles the grid shows for it:
         distinct images, with near-duplicates stacked as one. The folder itself is the path ''. Types are the filter's
         choices, in its order, and only those present."""
-        with connect(self.directory, rows=True) as db:
-            pairs = db.execute('''SELECT DISTINCT f.folder, coalesce(g.group_id, f.image_id) FROM files f
-                                  LEFT JOIN image_groups g ON g.image_id=f.image_id WHERE f.image_id IS NOT NULL''').fetchall()
-            counts = dict(db.execute(f'''SELECT {TYPE}, count(DISTINCT coalesce(g.group_id, i.id))
-                                         FROM images i LEFT JOIN image_groups g ON g.image_id=i.id GROUP BY 1''').fetchall())
-        folders: dict[str, set] = {}
-        for folder, tile in pairs:
-            # A folder counts the tiles in its subfolders too.
-            parts = folder.split('/') if folder else []
-            for depth in range(len(parts) + 1):
-                folders.setdefault('/'.join(parts[:depth]), set()).add(tile)
-        return {'folders': [{'path': path, 'count': len(tiles)} for path, tiles in sorted(folders.items(), key=lambda item: item[0].lower())],
-                'types': [{'type': kind, 'count': counts[kind]} for kind in TYPES if kind in counts]}
+        revision = self.revision
+        with self._facets_lock:
+            if self._facets is not None and self._facets[0] == revision:
+                return self._facets[1]
+            with connect(self.directory, rows=True) as db:
+                pairs = db.execute('''SELECT DISTINCT f.folder, coalesce(g.group_id, f.image_id) FROM files f
+                                      LEFT JOIN image_groups g ON g.image_id=f.image_id WHERE f.image_id IS NOT NULL''').fetchall()
+                counts = dict(db.execute(f'''SELECT {TYPE}, count(DISTINCT coalesce(g.group_id, i.id))
+                                             FROM images i LEFT JOIN image_groups g ON g.image_id=i.id GROUP BY 1''').fetchall())
+            folders: dict[str, set] = {}
+            for folder, tile in pairs:
+                # A folder counts the tiles in its subfolders too.
+                parts = folder.split('/') if folder else []
+                for depth in range(len(parts) + 1):
+                    folders.setdefault('/'.join(parts[:depth]), set()).add(tile)
+            result = {'folders': [{'path': path, 'count': len(tiles)} for path, tiles in sorted(folders.items(), key=lambda item: item[0].lower())],
+                      'types': [{'type': kind, 'count': counts[kind]} for kind in TYPES if kind in counts]}
+            self._facets = (revision, result)
+            return result
 
     def details(self, image_id):
         with connect(self.directory, rows=True) as db:
@@ -364,21 +431,39 @@ class Library:
         return preview
 
     def map(self, params):
-        """The newest MAP_LIMIT filtered images with a place on the map and an icon slot in the atlas."""
+        """The newest MAP_LIMIT filtered images with map positions and atlas slots for small views."""
         where, values = self.filters(params)
         rows = self.tiles(where, values)
-        self.require_search()
-        positions = self.layout.positions()
-        if positions is None:
-            # The first fit runs in the background, and the page follows its progress.
-            self.layout.start()
-            return {'points': [], 'pending': 0, 'sheets': [], 'layout': self.layout.status()}
-        shown = rows[:MAP_LIMIT]
-        slots = self.atlas.ensure()
+        cached = params.get('cached') == '1'
+        if cached:
+            positions = self.layout.positions(cached=True) or {}
+            positioned = [row for row in rows if row['id'] in positions]
+            pending = len(rows) - len(positioned)
+            visible = positioned[:MAP_LIMIT]
+            omitted = len(positioned) - len(visible)
+            if not positions or (pending and not visible):
+                return {'points': [], 'pending': pending, 'omitted': omitted, 'sheets': [],
+                        'layout': {'state': 'waiting'}}
+        else:
+            self.require_search()
+            positions = self.layout.positions()
+            if positions is None:
+                # The first fit runs in the background, and the page follows its progress.
+                self.layout.start()
+                return {'points': [], 'pending': 0, 'sheets': [], 'layout': self.layout.status()}
+            shown = rows[:MAP_LIMIT]
+            visible = [row for row in shown if row['id'] in positions]
+            pending = len(shown) - len(visible)
+            omitted = len(rows) - len(shown)
+        slots, sheets = {}, []
+        if not cached and len(visible) <= MAP_ATLAS_LIMIT:
+            slots = self.atlas.ensure([row['id'] for row in visible])
+            sheets = self.atlas.versions()
         points = []
-        for row in shown:
-            if row['id'] in positions and row['id'] in slots:
-                x, y = positions[row['id']]
-                points.append({**dict(row), 'x': round(x, 4), 'y': round(y, 4), 'slot': slots[row['id']]})
-        return {'points': points, 'pending': len(shown) - len(points), 'omitted': len(rows) - len(shown),
-                'sheets': self.atlas.versions(), 'layout': {'state': 'ready'}}
+        for row in visible:
+            image_id = row['id']
+            x, y = positions[image_id]
+            # Four decimals can collapse distinct neighbours into the same point at deep zoom.
+            points.append({**dict(row), 'x': round(x, 7), 'y': round(y, 7), 'slot': slots.get(image_id, -1)})
+        return {'points': points, 'pending': pending, 'omitted': omitted,
+                'sheets': sheets, 'layout': {'state': 'ready'}}

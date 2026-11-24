@@ -56,6 +56,36 @@ class LayoutTests(unittest.TestCase):
         self.assertTrue(all(np.linalg.norm(centres[a] - centres[b]) > 2 * spread for a in range(3) for b in range(a)))
         self.assertEqual(Layout(self.search).positions(), first)
 
+    def test_reopen_reads_only_current_persisted_positions_without_loading_vectors(self):
+        self.fit()
+        deleted, obsolete = f"{0:08x}", f"{1:08x}"
+        with connect(self.search.directory) as connection:
+            connection.execute("DELETE FROM images WHERE id = ?", (deleted,))
+            connection.execute("UPDATE semantic_embeddings SET model = 'old-model' WHERE image_id = ?", (obsolete,))
+        reopened = Layout(self.search)
+        with patch.object(self.search, "embeddings", side_effect=AssertionError("no vectors needed")):
+            positions = reopened.positions()
+            self.assertEqual(len(positions), 118)
+            self.assertNotIn(deleted, positions)
+            self.assertNotIn(obsolete, positions)
+            self.assertIs(reopened.positions(), positions)
+
+    def test_identical_vectors_are_fitted_once_and_each_image_has_a_position(self):
+        original = f"{0:08x}"
+        copy = self.add(0)
+        with connect(self.search.directory) as connection:
+            connection.execute("UPDATE semantic_embeddings SET vector = (SELECT vector FROM semantic_embeddings WHERE image_id = ?) WHERE image_id = ?",
+                               (original, copy))
+        with patch.object(layout, "embed", wraps=embed) as fitted:
+            self.fit()
+        self.assertEqual(len(fitted.call_args.args[0]), 120)
+        points = self.layout.positions()
+        self.assertEqual(len(points), 121)
+        separation = np.linalg.norm(np.subtract(points[original], points[copy]))
+        self.assertGreater(separation, 0)
+        self.assertLess(separation, 0.03)
+        self.assertEqual(Layout(self.search).positions(), points)
+
     def test_new_images_join_their_neighbours_without_moving_the_rest(self):
         self.fit()
         before = self.layout.positions()
@@ -65,6 +95,14 @@ class LayoutTests(unittest.TestCase):
         cluster = np.array([before[f"{n:08x}"] for n in range(40, 80)])
         self.assertLess(np.linalg.norm(np.array(after[newcomer]) - cluster.mean(axis=0)), 3 * cluster.std(axis=0).max() + 0.05)
         self.assertEqual(self.layout.status()["state"], "idle")
+
+    def test_cached_positions_avoid_loading_vectors_and_do_not_cache_partial_result(self):
+        self.fit()
+        before = self.layout.positions()
+        newcomer = self.add(1)
+        with patch.object(self.search, "embeddings", side_effect=AssertionError("no vectors needed")):
+            self.assertEqual(self.layout.positions(cached=True), before)
+        self.assertIn(newcomer, self.layout.positions())
 
     def test_a_flood_of_new_images_triggers_a_refit(self):
         self.fit()

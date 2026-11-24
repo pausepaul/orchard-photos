@@ -1,5 +1,7 @@
 """Private, on-device SigLIP 2 search. One encoder is shared by every folder; each folder keeps its own embeddings."""
 
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from io import BytesIO
 from itertools import count, takewhile
@@ -51,6 +53,7 @@ IMAGE_MEAN = IMAGE_STD = 0.5
 MAX_TOKENS = 64
 PAD = "<pad>"
 BATCH_SIZE = 16  # Also the Core ML model's fixed batch.
+VECTOR_CACHE_SIZE = 1024  # Recent exact inputs, about 3 MiB of SigLIP 2 vectors.
 DEPENDENCIES_MISSING = "Visual search needs its Python dependencies. Run the setup command and retry."
 logger = logging.getLogger(__name__)
 
@@ -367,6 +370,9 @@ class SemanticIndex:
                     PRIMARY KEY (image_id, model)
                 )
             """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS semantic_embeddings_model ON semantic_embeddings(model)
+            """)
 
     def _set_state(self, state, error=None):
         with self._state_lock:
@@ -379,8 +385,8 @@ class SemanticIndex:
             ).fetchone()
             total = connection.execute("SELECT COUNT(*) FROM images").fetchone()[0] if exists else 0
             indexed = connection.execute("""
-                SELECT COUNT(*) FROM semantic_embeddings e
-                JOIN images i ON i.id = e.image_id WHERE e.model = ?
+                SELECT COUNT(*) FROM images i
+                CROSS JOIN semantic_embeddings e ON e.image_id = i.id AND e.model = ?
             """, (MODEL,)).fetchone()[0] if exists else 0
             # Derived, not stored, since a scan can add images after a run: every image has a vector or can't be read.
             ready = total > 0 and (indexed == total or self._only_unreadable_pending(connection, total - indexed))
@@ -427,69 +433,106 @@ class SemanticIndex:
         with connect(self.directory) as connection:
             connection.execute("DELETE FROM semantic_embeddings WHERE model != ?", (MODEL,))
 
-    def _open_images(self, image_id) -> list:
-        """What search reads of an image: its thumbnail, or for a video the frames the scanner kept."""
+    def _read_inputs(self, image_id):
+        """Read the exact WebP inputs to the encoder, in frame order for videos."""
+        frames = list(takewhile(Path.is_file, (frame_path(self.directory, image_id, place) for place in count())))
+        try:
+            sources = [path.read_bytes() for path in frames or [thumbnail_path(self.directory, image_id)]]
+        except OSError:
+            return None
+        key = tuple(hashlib.sha256(source).digest() for source in sources)
+        return key, sources
+
+    @staticmethod
+    def _open_images(sources):
         from PIL import Image
 
-        frames = list(takewhile(Path.is_file, (frame_path(self.directory, image_id, place) for place in count())))
         opened = []
         try:
-            for path in frames or [thumbnail_path(self.directory, image_id)]:
-                with Image.open(path) as image:
+            for source in sources:
+                with Image.open(BytesIO(source)) as image:
                     opened.append(image.convert("RGB"))
         except (OSError, ValueError):
             for image in opened:
                 image.close()
-            raise
+            return None
         return opened
+
+    def _batch_vectors(self, pool, batch_ids, cached, unreadable):
+        """Reuse vectors only when the complete ordered encoder input is byte-identical."""
+        import numpy
+
+        inputs = pool.map(self._read_inputs, batch_ids) if pool is not None else map(self._read_inputs, batch_ids)
+        keys = {}
+        vectors = {}
+        pending = {}
+        for image_id, entry in zip(batch_ids, inputs):
+            if entry is None:
+                continue
+            key, sources = entry
+            keys[image_id] = key
+            if key in cached:
+                vectors[key] = cached[key]
+                cached.move_to_end(key)
+            else:
+                pending.setdefault(key, sources)
+
+        if pending:
+            decoded = pool.map(self._open_images, pending.values()) if pool is not None else map(self._open_images, pending.values())
+            opened = {key: frames for key, frames in zip(pending, decoded) if frames is not None}
+            if opened:
+                images = [image for frames in opened.values() for image in frames]
+                try:
+                    counts = [len(frames) for frames in opened.values()]
+                    features = numpy.split(self.encoder.features(images=images), numpy.cumsum(counts)[:-1])
+                    embedded = _unit(numpy.stack([frames.mean(axis=0) for frames in features]))
+                    for key, vector in zip(opened, embedded):
+                        vectors[key] = cached[key] = vector.astype("<f4").tobytes()
+                    while len(cached) > VECTOR_CACHE_SIZE:
+                        cached.popitem(last=False)
+                finally:
+                    for image in images:
+                        image.close()
+
+        rows = []
+        for image_id in batch_ids:
+            vector = vectors.get(keys.get(image_id))
+            if vector is None:
+                unreadable.add(image_id)
+                logger.warning("Could not read image %s for visual search", image_id)
+            else:
+                rows.append((image_id, MODEL, vector))
+        return rows
 
     def index(self, cancelled=lambda: False):
         """Embed new images until none are left, including any a scan adds meanwhile."""
-        import numpy
-
         if not self._index_lock.acquire(blocking=False):
             return
         try:
             self._set_state("idle")
             unreadable = set()
-            while True:
-                with connect(self.directory) as connection:
-                    connection.execute("""
-                        DELETE FROM semantic_embeddings WHERE image_id NOT IN (SELECT id FROM images)
-                    """)
-                    pending = [image_id for image_id in self._pending(connection) if image_id not in unreadable]
-                if not pending:
-                    break
-                self.encoder.load()
-                self._set_state("indexing")
-                for offset in range(0, len(pending), BATCH_SIZE):
-                    if cancelled():
-                        self._set_state("idle")
-                        return
-                    # A video's frames sit together in `images`, and `counts` says how many each image has.
-                    images, ids, counts = [], [], []
-                    for image_id in pending[offset:offset + BATCH_SIZE]:
-                        try:
-                            opened = self._open_images(image_id)
-                            images += opened
-                            ids.append(image_id)
-                            counts.append(len(opened))
-                        except (OSError, ValueError):
-                            unreadable.add(image_id)
-                            logger.warning("Could not read image %s for visual search", image_id)
-                    if not images:
-                        continue
-                    try:
-                        features = numpy.split(self.encoder.features(images=images), numpy.cumsum(counts)[:-1])
-                        vectors = _unit(numpy.stack([frames.mean(axis=0) for frames in features]))
-                        with connect(self.directory) as connection:
-                            connection.executemany(
-                                "INSERT OR REPLACE INTO semantic_embeddings VALUES (?, ?, ?)",
-                                [(image_id, MODEL, vector.astype("<f4").tobytes()) for image_id, vector in zip(ids, vectors)],
-                            )
-                    finally:
-                        for image in images:
-                            image.close()
+            cached = OrderedDict()
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                while True:
+                    with connect(self.directory) as connection:
+                        connection.execute("""
+                            DELETE FROM semantic_embeddings WHERE image_id NOT IN (SELECT id FROM images)
+                        """)
+                        pending = [image_id for image_id in self._pending(connection) if image_id not in unreadable]
+                    if not pending:
+                        break
+                    self.encoder.load()
+                    self._set_state("indexing")
+                    active_pool = pool if len(pending) > BATCH_SIZE else None
+                    for offset in range(0, len(pending), BATCH_SIZE):
+                        if cancelled():
+                            self._set_state("idle")
+                            return
+                        batch_ids = pending[offset:offset + BATCH_SIZE]
+                        rows = self._batch_vectors(active_pool, batch_ids, cached, unreadable)
+                        if rows:
+                            with connect(self.directory) as connection:
+                                connection.executemany("INSERT OR REPLACE INTO semantic_embeddings VALUES (?, ?, ?)", rows)
             self._unreadable = frozenset(unreadable)
             failed = len(unreadable)
             self._set_state("idle", f"{failed} {'file' if failed == 1 else 'files'} could not be read for visual search." if failed else None)
@@ -499,7 +542,7 @@ class SemanticIndex:
         finally:
             self._index_lock.release()
 
-    def embeddings(self):
+    def embeddings(self, *, refresh=False):
         """Return (ids, matrix) for indexed images, reloading only when the embeddings table changed."""
         import numpy
 
@@ -511,14 +554,18 @@ class SemanticIndex:
                        (SELECT COUNT(*) FROM images), (SELECT MAX(rowid) FROM images)
             """).fetchone()
             cached = self._matrix
-            if cached and cached[0] == version:
+            if not refresh and cached and cached[0] == version:
                 return cached[1], cached[2]
             rows = connection.execute("""
                 SELECT e.image_id, e.vector FROM semantic_embeddings e
                 JOIN images i ON i.id = e.image_id WHERE e.model = ?
             """, (MODEL,)).fetchall()
         ids = [identifier for identifier, _ in rows]
-        matrix = numpy.stack([numpy.frombuffer(vector, dtype="<f4") for _, vector in rows]) if rows else None
+        if rows:
+            raw = b"".join(vector for _, vector in rows)
+            matrix = numpy.frombuffer(raw, dtype="<f4").reshape(len(rows), -1).copy()
+        else:
+            matrix = None
         self._matrix = (version, ids, matrix)
         return ids, matrix
 

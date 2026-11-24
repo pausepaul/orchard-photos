@@ -39,30 +39,44 @@ class Atlas:
             result.append(f"{stat.st_mtime_ns:x}-{stat.st_size:x}")
         return result
 
-    def ensure(self) -> dict[str, int]:
-        """Give every image a slot, drawing icons for the new ones. Returns image id -> slot. New images take their
-        slots newest first, by the date the grid shows, so a map of the newest needs only the first sheets."""
-        with self._lock, connect(self.directory) as connection:
-            slots = dict(connection.execute("SELECT image_id, slot FROM atlas_slots"))
-            missing = connection.execute("""
-                SELECT i.id FROM images i LEFT JOIN files f ON f.image_id = i.id
-                WHERE i.id NOT IN (SELECT image_id FROM atlas_slots)
-                GROUP BY i.id ORDER BY max(coalesce(i.taken, f.modified)) DESC, i.rowid
-            """).fetchall()
+    def ensure(self, image_ids=None) -> dict[str, int]:
+        """Return the atlas slots for the requested IDs, drawing new icons in order, or fill the whole atlas by date."""
+        if image_ids is not None:
+            image_ids = dict.fromkeys(image_ids)
+            if not image_ids:
+                return {}
+        with self._lock:
+            with connect(self.directory) as connection:
+                slots = dict(connection.execute("SELECT image_id, slot FROM atlas_slots"))
+                if image_ids is None:
+                    selected = slots
+                    missing = [row[0] for row in connection.execute("""
+                        SELECT i.id FROM images i LEFT JOIN files f ON f.image_id = i.id
+                        WHERE i.id NOT IN (SELECT image_id FROM atlas_slots)
+                        GROUP BY i.id ORDER BY max(coalesce(i.taken, f.modified)) DESC, i.rowid
+                    """)]
+                else:
+                    selected = {i: slots[i] for i in image_ids if i in slots}
+                    missing = [i for i in image_ids if i not in slots]
             if not missing:
-                return slots
+                return selected
             first = max(slots.values(), default=-1) + 1
-            assigned = {image_id: first + offset for offset, (image_id,) in enumerate(missing)}
             with ThreadPoolExecutor(max_workers=4) as pool:
-                icons = list(pool.map(lambda row: self._icon(thumbnail_path(self.directory, row[0])), missing))
-            sheets: dict[int, list] = {}
-            for (image_id,), icon in zip(missing, icons):
-                sheets.setdefault(assigned[image_id] // PER_SHEET, []).append((assigned[image_id] % PER_SHEET, icon))
-            for sheet, tiles in sheets.items():
-                self._paste(sheet, tiles)
-            connection.executemany("INSERT INTO atlas_slots VALUES (?, ?)", assigned.items())
-            slots.update(assigned)
-            return slots
+                for start in range(0, len(missing), PER_SHEET):
+                    batch = missing[start:start + PER_SHEET]
+                    assigned = {image_id: first + start + offset for offset, image_id in enumerate(batch)}
+                    icons = list(pool.map(lambda image_id: self._icon(thumbnail_path(self.directory, image_id)), batch))
+                    sheets: dict[int, list] = {}
+                    for image_id, icon in zip(batch, icons):
+                        sheets.setdefault(assigned[image_id] // PER_SHEET, []).append((assigned[image_id] % PER_SHEET, icon))
+                    for sheet, tiles in sheets.items():
+                        self._paste(sheet, tiles)
+                    for icon in icons:
+                        icon.close()
+                    with connect(self.directory) as connection:
+                        connection.executemany("INSERT INTO atlas_slots VALUES (?, ?)", assigned.items())
+                    selected.update(assigned)
+            return selected
 
     def _icon(self, path: Path):
         from PIL import Image, ImageDraw, ImageOps

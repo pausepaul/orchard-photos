@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from time import strftime
 import urllib.error
 from urllib.parse import parse_qs, quote, urlparse
 import urllib.request
@@ -71,8 +72,9 @@ def tilde(path: Path) -> str:
 
 
 class App:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, *, watch=True):
         self.data_dir = Path(data_dir).resolve()
+        self.watch = watch
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.encoder = Encoder(self.data_dir / 'models')
         self.recent_path = self.data_dir / 'recent.json'
@@ -124,7 +126,8 @@ class App:
             key = hashlib.sha256(str(folder).encode()).hexdigest()[:16]
             library = self.library = Library(folder, self.data_dir / 'libraries' / key, self.encoder)
             self.remember(folder)
-        threading.Thread(target=library.scan, daemon=True).start()
+        if self.watch or not library.has_catalog():
+            threading.Thread(target=library.scan, daemon=True).start()
         return library
 
     def prepare(self):
@@ -183,6 +186,7 @@ class App:
                   for path in self.recent() if not library or path != str(library.folder)]
         result = {'app': APP['name'], 'version': APP['version'], 'platform': sys.platform, 'picker': self.window is not None or picker_command(None) is not None, 'recent': recent, 'folder': None, 'library': None,
                   'photos': str(photos.LIBRARY) if photos.available() else None,
+                  'watch': self.watch,
                   'model': {'present': self.encoder.downloaded() or self.encoder.activity is not None,
                             'size': self.encoder.size}}
         if library:
@@ -360,8 +364,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.forget(self.form().get('path'))
                 self.json(self.app.status())
             elif route == ('/api/scan', True):
-                # Asked for by hand, a scan also tries again what could not be read.
-                threading.Thread(target=self.app.current().scan, kwargs={'retry': True}, daemon=True).start()
+                # A browser reload checks for changes without retrying unchanged damaged files.
+                retry = self.form().get('retry') is not False
+                threading.Thread(target=self.app.current().scan, kwargs={'retry': retry}, daemon=True).start()
                 self.json({'started': True}, 202)
             elif route == ('/api/search/index', True):
                 self.app.prepare()
@@ -510,13 +515,44 @@ def bring_forward(url: str) -> bool:
         return False
 
 
+def console_progress(app: App):
+    """Log scan and indexing progress when Orchard is started from its console launcher."""
+    latest = None
+    while True:
+        library = app.library
+        if library is None:
+            message = 'Orchard wartet auf einen Bilderordner.'
+        else:
+            status = library.status()
+            counts, scan, search = status['counts'], status['scan'], status['search']
+            stage = f"Katalog: {counts['files']} Dateien"
+            if scan['state'] == 'scanning':
+                if scan.get('changed'):
+                    stage += f" | Neue/geaenderte Dateien: {scan['done']}/{scan['changed']}"
+                else:
+                    stage += f" | Dateiliste: {scan.get('found', 0)} gefunden"
+            message = (f"{library.folder.name} | {stage}"
+                       f" | Suchindex {search['state']}: {search['indexed']}/{search['total']}"
+                       f" | Lesefehler: {counts['unreadable']} | Gruppiert: {counts['nearDuplicates']}")
+            for activity in (scan, search):
+                if activity.get('error'):
+                    message += f" | {activity['error']}"
+        if message != latest:
+            print(f"[{strftime('%H:%M:%S')}] {message}", flush=True)
+            latest = message
+        threading.Event().wait(5)
+
+
 def arguments(argv=None):
     parser = argparse.ArgumentParser(prog=APP['slug'], description='Browse and search the images in a folder.')
     parser.add_argument('--version', action='version', version=f'{APP["name"]} {APP["version"]}')
     parser.add_argument('folder', nargs='?', help='folder to show; defaults to the last one opened')
     parser.add_argument('--port', type=int, default=APP['port'])
     parser.add_argument('--data-dir', type=Path, default=default_data_dir())
-    parser.add_argument('--no-watch', action='store_true', help='scan only on request, not every minute')
+    parser.add_argument('--no-watch', action='store_true', help='open existing catalogs from cache and scan on request')
+    parser.add_argument('--watch', dest='no_watch', action='store_false', help='check for changed files automatically')
+    parser.set_defaults(no_watch=False)
+    parser.add_argument('--progress', action='store_true', help='show scan and search progress in the console')
     # The launcher passes --window first, so a --browser after it wins.
     parser.add_argument('--window', dest='show', action='store_const', const='window', help='open in its own window')
     parser.add_argument('--browser', dest='show', action='store_const', const='browser', help='open in the browser instead')
@@ -560,7 +596,7 @@ def main(argv=None):
     if args.show == 'window' and (reason := unavailable()):
         print(f'{APP["name"]} is opening in the browser, because {reason}', flush=True)
         args.show = 'browser'
-    app = server.app = App(args.data_dir)
+    app = server.app = App(args.data_dir, watch=not args.no_watch)
     try:
         if folder:
             app.open(folder)
@@ -580,6 +616,8 @@ def main(argv=None):
         # Load the model before the first search, then index.
         app.prepare()
     print(f'{APP["name"]} is running at {url}', flush=True)
+    if args.progress:
+        threading.Thread(target=console_progress, args=(app,), daemon=True).start()
     if args.show == 'window':
         # The window runs on the main thread, as macOS requires, and closing it quits.
         app.window = Window(APP['name'], url, lambda image_id: app.library and app.library.original(image_id))

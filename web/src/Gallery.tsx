@@ -15,6 +15,8 @@ const ABOVE = 40;
 const BELOW = 12;
 // A pointer that rests on a tile this long, or presses it, loads its image for the viewer before the click.
 const PREPARE_DELAY = 100;
+// A short-lived request failure should not hide a tile until the page reloads.
+const PREVIEW_RETRY_DELAYS = [250, 1000];
 type Position = { left: number; top: number; width: number; height: number };
 
 /** The tile an arrow key moves to from `from`: the one before or after, or the nearest in the row above or below. */
@@ -214,6 +216,8 @@ export default function Gallery({ items, sections, onOpen, ref }: { items: Pictu
 interface TileProps { item: Picture; index: number; style: React.CSSProperties; stop: boolean; onOpen: (index: number) => void; onFocus: (index: number) => void; onPrepare: (item: Picture) => void }
 const Tile = memo(function Tile({ item, index, style, stop, onOpen, onFocus, onPrepare }: TileProps) {
   const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const retry = useRef(0);
   const resting = useRef(0);
   // An image that loads after its tile is drawn fades in. One the page already holds, as when scrolling back to it,
   // is simply there.
@@ -221,6 +225,17 @@ const Tile = memo(function Tile({ item, index, style, stop, onOpen, onFocus, onP
   const awaited = useRef(false);
   const [arrived, setArrived] = useState(false);
   useLayoutEffect(() => { awaited.current = !image.current!.complete; }, []);
+  useEffect(() => () => window.clearTimeout(retry.current), []);
+  const retryPreview = () => {
+    const delay = PREVIEW_RETRY_DELAYS[attempt];
+    if (delay === undefined) { setFailed(true); return; }
+    if (retry.current) return;
+    retry.current = window.setTimeout(() => {
+      retry.current = 0;
+      setAttempt(attempt + 1);
+    }, delay);
+  };
+  const preview = imageUrl(item.id) + (attempt ? `?retry=${attempt}` : '');
   const name = fileName(item.path);
   const label = item.members > 1 ? `Open ${name} and ${plural(item.members - 1, 'near-duplicate')}` : `Open ${name}`;
   // Only a pointer that moves readies the image, so a tile drawn under a still one, as when the viewer closes onto new
@@ -229,7 +244,7 @@ const Tile = memo(function Tile({ item, index, style, stop, onOpen, onFocus, onP
     onPointerMove={() => { resting.current ||= window.setTimeout(() => onPrepare(item), PREPARE_DELAY); }}
     onPointerLeave={() => { clearTimeout(resting.current); resting.current = 0; }}
     onPointerDown={() => onPrepare(item)}>
-    {failed ? <span className="missing">Preview unavailable</span> : <img ref={image} className={arrived ? 'arrived' : undefined} src={imageUrl(item.id)} alt={name} decoding="async" onDragStart={dragImage(item.id)} onLoad={() => setArrived(awaited.current)} onError={() => setFailed(true)} />}
+    {failed ? <span className="missing">Preview unavailable</span> : <img ref={image} className={arrived ? 'arrived' : undefined} src={preview} alt={name} decoding="async" onDragStart={dragImage(item.id)} onLoad={() => setArrived(awaited.current)} onError={retryPreview} />}
     {isVideo(item) && <span className="duration" aria-hidden="true"><Play />{item.duration ? durationLabel(item.duration) : null}</span>}
     {item.members > 1 && <span className="members" aria-hidden="true"><Layers />{item.members.toLocaleString()}</span>}
   </button>;

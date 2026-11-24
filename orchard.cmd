@@ -3,11 +3,17 @@ rem Start Orchard in its own window, or point the running one at another folder:
 rem Installs Python packages on first run, and again when requirements.txt changes.
 setlocal
 set "ROOT=%~dp0"
+if /i "%ORCHARD_POWERSHELL_CONSOLE%"=="1" goto console
+set "ORCHARD_POWERSHELL_CONSOLE=1"
+start "Orchard Photos (200k)" powershell.exe -NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "%ROOT%start-200k.ps1" %*
+exit /b %errorlevel%
+
+:console
 set "VENV=%ROOT%.venv"
 call :installed || call :install || goto failed
 rem -P and PYTHONPATH load Orchard from its own folder without changing directory, so a relative folder still works.
 set "PYTHONPATH=%ROOT:~0,-1%"
-"%VENV%\Scripts\python.exe" -P -m server.api --window %*
+"%VENV%\Scripts\python.exe" -u -P -m server.api --window --progress --no-watch %*
 if errorlevel 1 goto failed
 exit /b %errorlevel%
 

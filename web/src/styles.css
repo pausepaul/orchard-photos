@@ -330,6 +330,13 @@ main[data-timeline] .gallery { margin-right: calc(var(--page) + var(--inset) + v
 .map-controls { position: absolute; display: flex; gap: var(--s1); padding: var(--s1); background: var(--surface); border-radius: var(--surface-radius); box-shadow: var(--shadow); z-index: 3; }
 .map-controls { right: var(--page); bottom: var(--s6); flex-direction: column; }
 .map-controls .icon-button:hover { background: var(--soft); }
+.map-nearby { inset: 0; margin: auto; width: min(420px, calc(100vw - 32px)); max-height: min(560px, calc(100dvh - 32px)); }
+.map-nearby .panel-body { overscroll-behavior: contain; }
+.map-nearby-list { display: grid; gap: var(--s1); list-style: none; padding: 0; margin: 0; }
+.map-nearby-image { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: var(--s3); align-items: center; width: 100%; text-align: left; }
+.map-nearby-image img { width: 40px; height: 40px; object-fit: cover; border-radius: var(--control-radius); background: var(--soft); }
+.map-nearby-image span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-nearby .panel-body > .secondary { margin-top: var(--s3); }
 .map-progress { position: absolute; left: 0; right: 0; top: 0; z-index: 4; }
 .progress { height: var(--s1); background: var(--soft); border-radius: var(--pill); overflow: hidden; }
 .progress span { display: block; height: 100%; background: var(--ink); border-radius: inherit; transition: width var(--motion) var(--ease); }

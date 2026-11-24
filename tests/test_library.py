@@ -48,6 +48,20 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(self.ids({'folder': 'Trips/Japan'}), [trip])
         self.assertEqual(len(self.ids({})), 4)
 
+    def test_switching_filters_keeps_both_views_until_the_library_changes(self):
+        first = self.image(1, 'a/first.jpg')
+        self.image(2, 'b/second.jpg')
+        with patch.object(self.library, '_read_tiles', wraps=self.library._read_tiles) as read:
+            self.assertEqual(len(self.ids({})), 2)
+            self.assertEqual(self.ids({'folder': 'a'}), [first])
+            self.assertEqual(len(self.ids({})), 2)
+            self.assertEqual(read.call_count, 2)
+            third = self.image(3, 'a/third.jpg')
+            self.library.revision += 1
+            self.assertEqual(self.ids({'folder': 'a'}), [first, third])
+            self.assertEqual(len(self.ids({})), 3)
+            self.assertEqual(read.call_count, 4)
+
     def test_one_entry_per_image_described_by_its_newest_matching_copy(self):
         shared = self.image(1, 'old/a.jpg', modified='2026-01-01T12:00:00Z')
         self.image(1, 'new/a.jpg', modified='2026-09-01T12:00:00Z')
@@ -229,13 +243,16 @@ class LibraryTests(unittest.TestCase):
     def test_map_follows_filters_and_omits_images_not_yet_indexed(self):
         first = self.image(1, 'a/one.jpg')
         other = self.image(2, 'b/two.jpg')
-        waiting = self.image(3, 'a/three.jpg')
+        self.image(3, 'a/three.jpg')
         self.library.semantic = SimpleNamespace(status=lambda: {'indexed': 2})
         self.library.layout = SimpleNamespace(positions=lambda: {first: (0.1234567, -0.5), other: (1.0, 0.25)})
-        self.library.atlas = SimpleNamespace(ensure=lambda: {first: 0, other: 1, waiting: 2}, versions=lambda: ['v1'])
+        slots = {first: 0, other: 1}
+        ensure = Mock(side_effect=lambda ids: {i: slots[i] for i in ids})
+        self.library.atlas = SimpleNamespace(ensure=ensure, versions=lambda: ['v1'])
         result = self.library.map({'folder': 'a'})
+        ensure.assert_called_once_with([first])
         self.assertEqual([point['id'] for point in result['points']], [first])
-        self.assertEqual((result['points'][0]['x'], result['points'][0]['y'], result['points'][0]['slot']), (0.1235, -0.5, 0))
+        self.assertEqual((result['points'][0]['x'], result['points'][0]['y'], result['points'][0]['slot']), (0.1234567, -0.5, 0))
         self.assertEqual((result['pending'], result['sheets']), (1, ['v1']))
         self.assertEqual({point['id'] for point in self.library.map({})['points']}, {first, other})
 
@@ -243,15 +260,57 @@ class LibraryTests(unittest.TestCase):
         ids = [self.image(number, modified=f'2026-09-{number:02d}T12:00:00Z') for number in range(1, 4)]
         self.library.semantic = SimpleNamespace(status=lambda: {'indexed': 3})
         self.library.layout = SimpleNamespace(positions=lambda: {image_id: (0.0, 0.0) for image_id in ids})
-        self.library.atlas = SimpleNamespace(ensure=lambda: {image_id: n for n, image_id in enumerate(ids)}, versions=lambda: ['v1'])
+        self.library.atlas = SimpleNamespace(ensure=lambda shown: {image_id: ids.index(image_id) for image_id in shown}, versions=lambda: ['v1'])
         with patch('server.library.MAP_LIMIT', 2):
             result = self.library.map({})
         self.assertEqual(([point['id'] for point in result['points']], result['omitted']), ([ids[2], ids[1]], 1))
 
+    def test_large_map_serves_all_positions_without_building_the_icon_atlas(self):
+        first = self.image(1)
+        other = self.image(2)
+        self.library.semantic = SimpleNamespace(status=lambda: {'indexed': 2})
+        self.library.layout = SimpleNamespace(positions=lambda: {first: (0.1, -0.2), other: (0.3, -0.4)})
+        self.library.atlas = Mock()
+        with patch('server.library.MAP_ATLAS_LIMIT', 1):
+            result = self.library.map({})
+        self.assertEqual([(point['id'], point['x'], point['y'], point['slot']) for point in result['points']],
+                         [(first, 0.1, -0.2, -1), (other, 0.3, -0.4, -1)])
+        self.assertEqual((result['pending'], result['omitted'], result['sheets']), (0, 0, []))
+        self.assertEqual(self.library.atlas.mock_calls, [])
+
+    def test_map_retains_fine_position_differences_for_deep_zoom(self):
+        first, second = self.image(1), self.image(2)
+        coordinates = {first: (0.13561231, -0.20304049), second: (0.13561289, -0.20304049)}
+        self.library.layout = SimpleNamespace(positions=lambda *, cached: coordinates)
+        result = self.library.map({'cached': '1'})
+        self.assertEqual([(p['id'], p['x'], p['y']) for p in result['points']],
+                         [(first, 0.1356123, -0.2030405), (second, 0.1356129, -0.2030405)])
+
+    def test_cached_map_keeps_positioned_images_when_newer_images_are_pending(self):
+        first, second, _ = [self.image(number, modified=f'2026-09-{number:02d}T12:00:00Z') for number in range(1, 4)]
+        self.library.layout = Mock(positions=lambda *, cached: {first: (0.0, 0.0), second: (1.0, 1.0)})
+        self.library.atlas = Mock()
+        with patch('server.library.MAP_LIMIT', 1):
+            result = self.library.map({'cached': '1'})
+        self.assertEqual([(p['id'], p['slot']) for p in result['points']], [(second, -1)])
+        self.assertEqual((result['pending'], result['omitted'], result['sheets']), (1, 1, []))
+        self.library.layout.start.assert_not_called()
+        self.assertEqual(self.library.atlas.mock_calls, [])
+
+    def test_cached_map_returns_waiting_without_starting_layout_when_no_positions_exist(self):
+        self.image(1)
+        self.library.semantic = Mock()
+        self.library.layout = Mock(positions=lambda *, cached: {})
+        result = self.library.map({'cached': '1'})
+        self.assertEqual(result['layout']['state'], 'waiting')
+        self.assertEqual((result['points'], result['pending'], result['omitted']), ([], 1, 0))
+        self.library.layout.start.assert_not_called()
+        self.assertEqual(self.library.semantic.mock_calls, [])
+
     def test_map_waits_for_its_first_fit_then_serves_positions(self):
         first = self.image(1)
         self.library.semantic = SimpleNamespace(status=lambda: {'indexed': 1})
-        self.library.atlas = SimpleNamespace(ensure=lambda: {first: 0}, versions=lambda: ['v1'])
+        self.library.atlas = SimpleNamespace(ensure=lambda ids: {i: 0 for i in ids}, versions=lambda: ['v1'])
         positions = [None, {first: (0.5, -0.5)}]
         self.library.layout = Mock(positions=lambda: positions.pop(0), status=lambda: {'state': 'computing', 'stage': 'Laying out the map'})
         waiting = self.library.map({})

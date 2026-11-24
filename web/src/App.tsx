@@ -15,7 +15,7 @@ import { FilterPanel, FolderChooser, FolderPanel, SearchMenu } from './Panels';
 import { APP_NAME, IMAGE_DRAG, countNoun, defaults, draggedImage, filterParams, imageUrl, isFiltered, plural, post, preparing, rangeLabel, readPreferences, request, savePreferences, searchCondition, SET_UP, slowMotion, typeLabel } from './types';
 import type { Filters, Picture, Results, SearchMode, Status, Timeline as TimelineData, View } from './types';
 const initial = readPreferences();
-// Reloading the page, with Cmd or Ctrl and R, also rescans the folder at once, trying again what could not be read.
+// While watching the folder, a page reload checks for new or changed files.
 let reloaded = (performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined)?.type === 'reload';
 const IMAGE_ID = /^[a-f0-9]{64}$/;
 const droppable = (e: React.DragEvent) => e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes(IMAGE_DRAG);
@@ -168,11 +168,12 @@ export default function App() {
   // Poll quickly while progress is moving, gently otherwise.
   const polling = status?.library?.scan.state === 'scanning' || (!!search && preparing(search)) ? 1000 : 4000;
   useEffect(() => { void refreshStatus(); const timer = setInterval(refreshStatus, polling); return () => clearInterval(timer); }, [refreshStatus, polling]);
+  const watching = status?.watch !== false;
   useEffect(() => {
     if (!ready || !reloaded) return;
     reloaded = false;
-    post('/api/scan').then(refreshStatus, () => { /* The minute's own scan follows. */ });
-  }, [ready, refreshStatus]);
+    if (watching) post('/api/scan', { retry: false }).then(refreshStatus, () => { /* The minute's own scan follows. */ });
+  }, [ready, refreshStatus, watching]);
   // Another folder was opened, here or from the command line: its subfolders and searches start fresh.
   useEffect(() => {
     if (!status) return;
@@ -327,7 +328,7 @@ export default function App() {
     // Slash, or Cmd or Ctrl and K, goes to the search bar from anywhere but a text field. A viewer or panel over it
     // closes first, since searching replaces what it shows; flushSync lets it hand focus back before the bar takes it.
     const keyboard = (e: KeyboardEvent) => {
-      // Cmd or Ctrl and R reloads, which rescans. The Mac window's View menu takes the key before the page does, but
+      // The Mac window's View menu takes the reload key before the page does, but
       // the Windows and Linux windows leave it to the page.
       if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'r') { e.preventDefault(); location.reload(); return; }
       const slash = e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && !typing(e.target);
@@ -418,7 +419,7 @@ export default function App() {
       {loading && !items.length ? <div className="skeleton" aria-label="Loading images">{Array.from({ length: 5 }, (_, i) => <span key={i} />)}</div>
       : !items.length && !error ? (queryMode === 'name' && condition && !visualReady ? <div className="empty"><h1>No file names match</h1><p>{condition === 'starting' ? 'Searching by description works once visual search is ready. Its progress shows above.' : condition === 'failed' ? `${searchWork(search!)?.label}. Try again to find images by describing them.` : `${SET_UP} to find images by describing them.`}</p>{condition === 'starting' ? <button className="text-button secondary" onClick={clearSearch}>Clear search</button> : <button className="text-button primary" onClick={() => { clearSearch(); void setUpSearch(); }}>{setUpLabel}</button>}</div>
         : searching || filtered ? <div className="empty"><h1>No images here</h1><p>Try another search, or widen the folder, type or date filters.</p><button className="text-button secondary" onClick={reset}>Clear search and filters</button></div>
-        : gathering ? <div className="empty"><h1>Gathering your images</h1><p>{scan?.changed ? `Reading ${scan.done?.toLocaleString()} of ${plural(scan.changed, 'file')}. Images appear as they are found.` : scan?.found ? `${plural(scan.found, 'file')} found so far.` : 'Looking through this folder and its subfolders.'}</p>{scanProgress.left && <p>{scanProgress.left}</p>}<div className="empty-progress"><Progress value={scanProgress.value} label="Reading images" steady /></div></div>
+        : gathering ? <div className="empty"><h1>Gathering your images</h1><p>{scan?.changed ? `Reading ${scan.done?.toLocaleString()} of ${plural(scan.changed, 'new or changed file')}. Images appear as they are found.` : scan?.found ? `${plural(scan.found, 'file')} found so far.` : 'Looking through this folder and its subfolders.'}</p>{scanProgress.left && <p>{scanProgress.left}</p>}<div className="empty-progress"><Progress value={scanProgress.value} label="Reading new or changed images" steady /></div></div>
         : <div className="empty"><h1>No images or videos in this folder</h1><p>{APP_NAME} found nothing here it can read. Hidden folders are skipped.</p><button className="text-button secondary" onClick={() => setPanel('folder')}>Choose another folder</button></div>)
       : <Gallery ref={galleryRef} items={items} sections={dated} onOpen={setSelected} />}
       {timelineShown && <Timeline data={timeline.data} loaded={items.length} gallery={galleryRef} header={headerRef} onReach={reach} />}

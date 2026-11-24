@@ -76,6 +76,20 @@ class AppTests(unittest.TestCase):
         self.assertNotEqual(first.directory, second.directory)
         self.assertEqual(self.app.status()['folder']['path'], str(self.home / 'two'))
 
+    def test_cache_first_start_scans_a_new_catalog_only(self):
+        folder = self.folder('photos')
+        app = App(self.home / 'data', watch=False)
+        with patch('server.api.threading.Thread') as thread:
+            first = app.open(str(folder))
+            thread.assert_called_once_with(target=first.scan, daemon=True)
+        first.stats_path.write_text('{"updated":"last scan"}', encoding='utf-8')
+        reopened = App(self.home / 'data', watch=False)
+        with patch('server.api.threading.Thread') as thread:
+            library = reopened.open(str(folder))
+            thread.assert_not_called()
+        self.assertEqual(library.directory, first.directory)
+        self.assertFalse(reopened.status()['watch'])
+
     def test_recent_folders_are_newest_first_bounded_and_forgettable(self):
         for number in range(RECENT_LIMIT + 2):
             self.app.open(str(self.folder(f'folder-{number}')))
@@ -195,6 +209,12 @@ class HandlerTests(unittest.TestCase):
         with patch('server.api.threading.Thread') as thread:
             handler = self.dispatch('/api/scan', {**LOCAL, 'Content-Type': 'application/json', 'Content-Length': '2'}, True, b'{}')
         thread.assert_called_once_with(target=handler.server.app.current.return_value.scan, kwargs={'retry': True}, daemon=True)
+
+    def test_browser_reload_scan_can_skip_unchanged_unreadable_files(self):
+        body = b'{"retry":false}'
+        with patch('server.api.threading.Thread') as thread:
+            handler = self.dispatch('/api/scan', {**JSON, 'Content-Length': str(len(body))}, True, body)
+        thread.assert_called_once_with(target=handler.server.app.current.return_value.scan, kwargs={'retry': False}, daemon=True)
 
     def test_every_response_says_it_may_not_be_framed_or_sniffed(self):
         server = Server(('127.0.0.1', 0), Handler)

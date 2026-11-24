@@ -1,5 +1,12 @@
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo-inverted.svg"><img src="docs/logo.svg" alt="Orchard Photos" height="56"></picture>
 
+## Windows fork
+
+An unofficial fork of [Orchard Photos by Chase Lean](https://github.com/chaseleantj/orchard-photos), based on the MIT-licensed Orchard Photos 0.6 source. This fork adds improvements for large local libraries on Windows: opening an existing catalog from cache, manual rescanning, deeper map zoom and retries for previews.
+
+To run this fork from source on Windows, run the [orchard.cmd](orchard.cmd) launcher in this repository and choose your image folder. See [Windows setup notes](ANLEITUNG-200k.md) and [third-party notices](THIRD-PARTY-NOTICES.txt).
+
+
 <p align="center"><img src="docs/hero.gif" width="800" alt="Orchard Photos: a photo of the Colosseum is dragged onto the search bar and similar photos of Rome fill the grid; typing &quot;a bowl of noodles&quot; brings up photos of noodles; the map then lights up those noodle photos, grouped together among similar food, and zooms in on them."></p>
 
 Orchard is a free app for finding photos and videos on your computer. Open a folder, and Orchard shows every photo and video in it as one timeline. To find a photo, describe it, like "dog on a beach", or drop in a similar photo.
@@ -17,7 +24,9 @@ Most photo apps with this kind of search upload your library to a server. Orchar
 - **Browse by folder** in a sidebar, and **filter** by file type and date.
 - **See fewer duplicates.** Copies, bursts and edits of the same photo share one tile.
 
-## Download
+## Upstream downloads
+
+These downloads are for the original Orchard Photos releases.
 
 | Computer | Download |
 | --- | --- |

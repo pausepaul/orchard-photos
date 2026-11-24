@@ -9,12 +9,14 @@ rearrange each time a few photos are added.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import logging
 import threading
 
 import numpy
 
 from server.cache import connect
+from server.semantic import MODEL
 
 NEIGHBOURS = 15
 # UMAP's curve 1 / (1 + a d^2b) for how strongly two points attract at distance d, fitted for min_dist 0.25.
@@ -188,6 +190,30 @@ def embed(matrix):
     return numpy.column_stack([x, y])
 
 
+def _unique_vectors(matrix, rows=None):
+    """First row of each byte-identical vector and the class of every requested row, in input order."""
+    rows = range(len(matrix)) if rows is None else rows
+    by_digest = {}
+    representatives = []
+    classes = numpy.empty(len(rows), dtype=numpy.intp)
+    for index, row in enumerate(rows):
+        vector = memoryview(matrix[row]).cast('B')
+        matches = by_digest.setdefault(hashlib.sha256(vector).digest(), [])
+        for group in matches:
+            if vector == memoryview(matrix[representatives[group]]).cast('B'):
+                break
+        else:
+            group = len(representatives)
+            representatives.append(row)
+            matches.append(group)
+        classes[index] = group
+    return numpy.asarray(representatives, dtype=numpy.intp), classes
+
+
+def _jitter(image_id):
+    return numpy.random.default_rng(int(image_id[:8], 16)).normal(scale=0.006, size=2)
+
+
 class Layout:
     def __init__(self, semantic):
         self.semantic = semantic
@@ -195,6 +221,7 @@ class Layout:
         self._lock = threading.Lock()
         self._state = {"state": "idle"}
         self._cache = None
+        self._position_generation = 0
         with connect(self.directory) as connection:
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS umap_positions (
@@ -209,6 +236,7 @@ class Layout:
         """Forget every position, so the next map is fitted afresh."""
         with connect(self.directory) as connection:
             connection.execute("DELETE FROM umap_positions")
+        self._position_generation += 1
         self._cache = None
 
     def _set(self, state, stage="", error=None):
@@ -228,11 +256,19 @@ class Layout:
             if not ids:
                 self._set("idle")
                 return
-            points = self._normalise(embed(matrix))
+            representatives, classes = _unique_vectors(matrix)
+            if len(representatives) == len(matrix):
+                points = self._normalise(embed(matrix))
+            else:
+                # Exact copies share one graph point. Scatter only the copies so they can still be selected separately.
+                points = self._normalise(embed(matrix[representatives]))[classes]
+                for row in numpy.flatnonzero(representatives[classes] != numpy.arange(len(ids))):
+                    points[row] += _jitter(ids[row])
             with connect(self.directory) as connection:
                 connection.execute("DELETE FROM umap_positions")
                 connection.executemany("INSERT INTO umap_positions VALUES (?, ?, ?, 1)",
-                                       [(i, float(x), float(y)) for i, (x, y) in zip(ids, points)])
+                                       ((i, float(x), float(y)) for i, (x, y) in zip(ids, points)))
+            self._position_generation += 1
             self._cache = None
             self._set("idle")
         except Exception:
@@ -248,41 +284,63 @@ class Layout:
         extent = float(numpy.percentile(numpy.abs(points).max(axis=1), 99)) or 1.0
         return points / extent
 
-    def positions(self):
-        """Fitted positions for every indexed image, or None before the first fit. Newer images are placed, not fitted."""
-        ids, matrix = self.semantic.embeddings()
-        if not ids:
-            return {}
-        if self._cache and self._cache[0] is matrix:
-            return self._cache[1]
+    def positions(self, *, cached=False):
+        """Fitted positions for indexed images, or None before the first fit. Cached reads never place new images."""
+        generation = self._position_generation
         with connect(self.directory) as connection:
-            stored = {i: (x, y, fitted) for i, x, y, fitted in connection.execute("SELECT * FROM umap_positions")}
-        rows = [n for n, i in enumerate(ids) if i in stored]
-        if not rows:
+            connection.execute("BEGIN")
+            revision = connection.execute("""
+                SELECT (SELECT COUNT(*) FROM semantic_embeddings), (SELECT MAX(rowid) FROM semantic_embeddings),
+                       (SELECT COUNT(*) FROM images), (SELECT MAX(rowid) FROM images)
+            """).fetchone()
+            key = generation, revision
+            previous = self._cache
+            if previous and previous[0] == key:
+                return previous[1]
+            # The membership check uses the embedding primary key without reading the vector blobs.
+            indexed = connection.execute("""
+                SELECT i.id, p.x, p.y, p.fitted
+                FROM images i LEFT JOIN umap_positions p ON p.image_id = i.id
+                WHERE EXISTS (
+                    SELECT 1 FROM semantic_embeddings e WHERE e.image_id = i.id AND e.model = ?
+                )
+            """, (MODEL,)).fetchall()
+        if not indexed:
+            return {}
+        stored = {i: (x, y, fitted) for i, x, y, fitted in indexed if fitted is not None}
+        if not stored:
             return None
-        result = {ids[n]: stored[ids[n]][:2] for n in rows}
-        missing = [n for n, i in enumerate(ids) if i not in stored]
-        if missing:
-            result.update(self._place(ids, matrix, rows, missing, stored))
-            fitted = sum(1 for n in rows if stored[ids[n]][2])
-            if len(missing) > REFIT_SHARE * max(1, fitted):
-                self.start()
-        self._cache = (matrix, result)
+        if cached or len(stored) == len(indexed):
+            result = {i: position[:2] for i, position in stored.items()}
+            if len(stored) < len(indexed):
+                return result
+        else:
+            ids, matrix = self.semantic.embeddings()
+            rows = [n for n, i in enumerate(ids) if i in stored]
+            if not rows:
+                return None if ids else {}
+            result = {ids[n]: stored[ids[n]][:2] for n in rows}
+            missing = [n for n, i in enumerate(ids) if i not in stored]
+            if missing:
+                result.update(self._place(ids, matrix, rows, missing, stored))
+                fitted = sum(1 for n in rows if stored[ids[n]][2])
+                if len(missing) > REFIT_SHARE * max(1, fitted):
+                    self.start()
+        self._cache = key, result
         return result
 
     def _place(self, ids, matrix, rows, missing, stored):
         """Put each new image at the similarity-weighted centre of its nearest fitted neighbours."""
         coordinates = numpy.array([stored[ids[n]][:2] for n in rows])
-        nearest, values = _nearest(matrix[missing], matrix[rows], min(PLACE_NEIGHBOURS, len(rows)))
+        representatives, classes = _unique_vectors(matrix, missing)
+        nearest, values = _nearest(matrix[representatives], matrix[rows], min(PLACE_NEIGHBOURS, len(rows)))
         weights = numpy.exp((values - values.max(axis=1, keepdims=True)) / 0.05)
         weights /= weights.sum(axis=1, keepdims=True)
         centres = (weights[:, :, None] * coordinates[nearest]).sum(axis=1)
         placed = {}
-        for n, centre in zip(missing, centres):
+        for n, group in zip(missing, classes):
             # A little deterministic scatter keeps look-alikes from stacking on one spot.
-            seed = int(ids[n][:8], 16)
-            jitter = numpy.random.default_rng(seed).normal(scale=0.006, size=2)
-            placed[ids[n]] = tuple(float(v) for v in centre + jitter)
+            placed[ids[n]] = tuple(float(v) for v in centres[group] + _jitter(ids[n]))
         with connect(self.directory) as connection:
             connection.executemany("INSERT OR REPLACE INTO umap_positions VALUES (?, ?, ?, 0)",
                                    [(i, x, y) for i, (x, y) in placed.items()])
